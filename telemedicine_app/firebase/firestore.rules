@@ -1,0 +1,29 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // rooms/{roomId} — ห้อง signaling
+    match /rooms/{roomId} {
+
+      // อนุญาตให้อ่านและสร้างห้องใหม่ได้
+      // (prototype: ยังไม่ต้อง auth — สำหรับ production ควรเพิ่ม auth)
+      allow read, create: if true;
+
+      // อนุญาตให้ update เฉพาะ field ที่อนุญาต (answer, status)
+      allow update: if request.resource.data.keys().hasOnly([
+        'offer', 'answer', 'status', 'createdAt'
+      ]);
+
+      // ICE candidates ของ caller (patient)
+      match /caller_candidates/{candidateId} {
+        allow read, write: if true;
+      }
+
+      // ICE candidates ของ callee (doctor)
+      match /callee_candidates/{candidateId} {
+        allow read, write: if true;
+      }
+    }
+  }
+}

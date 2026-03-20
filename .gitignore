@@ -1,0 +1,59 @@
+# ===== Generated Analysis Files =====
+heart_sound_metrics.png
+heart_sound_bands.png
+heart_sound_waveform.png
+heart_sound_analysis.csv
+
+# ===== Heart Sound Data (ใหญ่เกินไปสำหรับ git) =====
+Heart_sound/
+Heart sound/
+telemedicine_app/assets/heart_sounds/
+
+# ===== IDE History =====
+.history/
+
+# ===== Flutter =====
+telemedicine_app/.dart_tool/
+telemedicine_app/.flutter-plugins
+telemedicine_app/.flutter-plugins-dependencies
+telemedicine_app/build/
+telemedicine_app/.packages
+telemedicine_app/pubspec.lock
+telemedicine_app/.idea/
+telemedicine_app/*.iml
+telemedicine_app/android/.gradle/
+telemedicine_app/android/local.properties
+telemedicine_app/android/key.properties
+telemedicine_app/ios/.symlinks/
+telemedicine_app/ios/Pods/
+telemedicine_app/ios/Podfile.lock
+telemedicine_app/macos/Pods/
+telemedicine_app/linux/flutter/
+telemedicine_app/windows/flutter/
+
+# Firebase (secrets — ห้าม commit เด็ดขาด)
+telemedicine_app/lib/firebase_options.dart
+telemedicine_app/android/app/google-services.json
+telemedicine_app/ios/Runner/GoogleService-Info.plist
+telemedicine_app/macos/Runner/GoogleService-Info.plist
+
+# ===== Python / Jupyter =====
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+.pytest_cache/
+
+# ===== macOS =====
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# ===== Logs =====
+*.log
