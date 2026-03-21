@@ -89,16 +89,14 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 
   void _toggleRecord() {
     if (_rec.isRecording) {
-      // หยุดบันทึก — บันทึกลง list พร้อม asset path ของ simulated sound
-      final asset = _audio.simAsset ?? _recPosition.assetPath('0');
-      _rec.stopRecording(_recPosition.label, asset);
+      _rec.stopRecording(_recPosition.label);
     } else {
-      // เลือกตำแหน่งก่อน record
       _showPositionPicker();
     }
   }
 
   void _showPositionPicker() {
+    final webrtc = context.read<WebRTCService>();
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
@@ -114,7 +112,8 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                 onChanged: (v) {
                   setState(() => _recPosition = v!);
                   Navigator.pop(context);
-                  _rec.startRecording(pos.label);
+                  // ส่ง remote stream เพื่อบันทึกเสียงหัวใจจริงจาก WebRTC
+                  _rec.startRecording(pos.label, stream: webrtc.remoteStream);
                 },
               ),
             );
@@ -240,7 +239,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                       },
                       onRecord: _toggleRecord,
                       onHangUp: () async {
-                        if (rec.isRecording) rec.stopRecording(_recPosition.label, '');
+                        if (rec.isRecording) await rec.cancelRecording();
                         await webrtc.hangUp();
                         if (mounted) Navigator.pop(context);
                       },
@@ -275,12 +274,6 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 class _RecordingsPanel extends StatelessWidget {
   final RecordingService rec;
   const _RecordingsPanel({required this.rec});
-
-  String _formatDuration(Duration d) {
-    final m = d.inMinutes.toString().padLeft(2, '0');
-    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
-    return '$m:$s';
-  }
 
   @override
   Widget build(BuildContext context) {
