@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "your-messaging-sender-id",
+    "project_id": "your-firebase-project-id",
+    "storage_bucket": "your-project.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:SENDER_ID:android:APP_ID",
+        "android_client_info": {
+          "package_name": "com.yourcompany.yourapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "your-android-api-key"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

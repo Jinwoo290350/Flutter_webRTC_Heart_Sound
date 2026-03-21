@@ -31,8 +31,9 @@ telemedicine_app/macos/Pods/
 telemedicine_app/linux/flutter/
 telemedicine_app/windows/flutter/
 
-# Firebase (secrets — ห้าม commit เด็ดขาด)
-telemedicine_app/lib/firebase_options.dart
+# Firebase secrets — ห้าม commit เด็ดขาด
+# firebase_options.dart สามารถ commit ได้เพราะใช้ String.fromEnvironment() แล้ว
+telemedicine_app/.env
 telemedicine_app/android/app/google-services.json
 telemedicine_app/ios/Runner/GoogleService-Info.plist
 telemedicine_app/macos/Runner/GoogleService-Info.plist
