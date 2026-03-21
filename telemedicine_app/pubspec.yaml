@@ -29,6 +29,9 @@ dependencies:
   # เล่น recording เสียงหัวใจ
   audioplayers: ^6.0.0
 
+  # configure AudioSession ก่อน WebRTC — ปิด voice processing ระดับ OS
+  audio_session: ^0.1.21
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

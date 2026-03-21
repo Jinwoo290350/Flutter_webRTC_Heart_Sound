@@ -1,46 +1,291 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <!--
-    If you are serving your web app in a path other than the root, change the
-    href value below to reflect the base path you are serving from.
-
-    The path provided below has to start and end with a slash "/" in order for
-    it to work correctly.
-
-    For more details:
-    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
-
-    This is a placeholder for base href that will be replaced by the value of
-    the `--base-href` argument provided to `flutter build`.
-  -->
   <base href="$FLUTTER_BASE_HREF">
-
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
-
-  <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="apple-mobile-web-app-title" content="telemedicine_app">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
-
-  <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
-
   <title>telemedicine_app</title>
   <link rel="manifest" href="manifest.json">
+
+  <style>
+    #audio-unlock-overlay {
+      display: none;
+      position: fixed;
+      bottom: 90px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.85);
+      color: white;
+      padding: 14px 26px;
+      border-radius: 30px;
+      font-size: 15px;
+      font-family: -apple-system, sans-serif;
+      z-index: 9999;
+      cursor: pointer;
+      border: 1.5px solid rgba(255,255,255,0.35);
+      white-space: nowrap;
+      animation: pulse-btn 2s ease-in-out infinite;
+    }
+    #audio-unlock-overlay.show { display: block; }
+    @keyframes pulse-btn {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.65; }
+    }
+  </style>
 </head>
 <body>
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
+  <div id="audio-unlock-overlay">🔊 แตะที่นี่เพื่อเปิดเสียง</div>
 
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
-  -->
+  <script>
+  // ============================================================
+  // 1. RTCPeerConnection interceptor
+  //    เก็บ reference ทุก PC ที่ flutter_webrtc สร้าง
+  //    เพื่อให้ replaceTrack() ใช้งานได้ทีหลัง
+  // ============================================================
+  (function () {
+    var _Orig = window.RTCPeerConnection;
+    window._pcs = [];
+
+    function PatchedPC(config) {
+      var pc = new _Orig(config);
+      window._pcs.push(pc);
+      var origClose = pc.close.bind(pc);
+      pc.close = function () {
+        window._pcs = window._pcs.filter(function (p) { return p !== pc; });
+        origClose();
+      };
+      return pc;
+    }
+    PatchedPC.prototype = _Orig.prototype;
+    Object.assign(PatchedPC, _Orig);
+    window.RTCPeerConnection = PatchedPC;
+  })();
+
+  // ============================================================
+  // 2. Simulation audio injection
+  //    เล่น WAV asset และ inject เข้า WebRTC audio track
+  //    แทนที่จะเล่นออก speaker อย่างเดียว
+  // ============================================================
+  var _simAudio    = null;
+  var _simCtx      = null;
+  var _simOrigTrack = null;
+  var _simNewTrack  = null;
+
+  window.startSimAudio = async function (assetPath) {
+    try {
+      // หยุดอันเก่าก่อน
+      if (_simAudio) { _simAudio.pause(); _simAudio = null; }
+      if (_simCtx)   { await _simCtx.close(); _simCtx = null; }
+
+      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      await ctx.resume();
+
+      // สร้าง URL จาก asset path (relative to page)
+      var url = new URL(assetPath, window.location.href).href;
+      var audio = new Audio(url);
+      audio.loop = true;
+      audio.crossOrigin = 'anonymous';
+
+      var src  = ctx.createMediaElementSource(audio);
+      var dest = ctx.createMediaStreamDestination();
+      src.connect(dest);
+
+      await audio.play();
+      _simAudio    = audio;
+      _simCtx      = ctx;
+      _simNewTrack = dest.stream.getAudioTracks()[0];
+
+      // inject เข้าทุก RTCPeerConnection ที่เปิดอยู่
+      var injected = false;
+      for (var pc of (window._pcs || [])) {
+        for (var sender of pc.getSenders()) {
+          if (sender.track && sender.track.kind === 'audio') {
+            _simOrigTrack = sender.track;
+            await sender.replaceTrack(_simNewTrack);
+            injected = true;
+            console.log('[SimAudio] ✅ injected into WebRTC track');
+            break;
+          }
+        }
+      }
+      if (!injected) {
+        console.warn('[SimAudio] ⚠️ no audio sender found — will retry on next call connect');
+      }
+    } catch (e) {
+      console.error('[SimAudio] error:', e);
+    }
+  };
+
+  // เรียกใหม่เมื่อ PC เชื่อมต่อสำเร็จ (กรณี sim เริ่มก่อน call)
+  window._retrySimInject = async function () {
+    if (!_simNewTrack) return;
+    for (var pc of (window._pcs || [])) {
+      for (var sender of pc.getSenders()) {
+        if (sender.track && sender.track.kind === 'audio' &&
+            sender.track !== _simNewTrack) {
+          _simOrigTrack = sender.track;
+          await sender.replaceTrack(_simNewTrack);
+          console.log('[SimAudio] ✅ retried inject');
+        }
+      }
+    }
+  };
+
+  window.stopSimAudio = async function () {
+    try {
+      if (_simAudio) { _simAudio.pause(); _simAudio.src = ''; _simAudio = null; }
+      if (_simCtx)   { await _simCtx.close(); _simCtx = null; }
+
+      // คืน track เดิม
+      if (_simOrigTrack && _simNewTrack) {
+        for (var pc of (window._pcs || [])) {
+          for (var sender of pc.getSenders()) {
+            if (sender.track === _simNewTrack) {
+              await sender.replaceTrack(_simOrigTrack);
+              console.log('[SimAudio] ✅ restored original mic track');
+            }
+          }
+        }
+      }
+      _simOrigTrack = null;
+      _simNewTrack  = null;
+    } catch (e) {
+      console.error('[SimAudio] stop error:', e);
+    }
+  };
+
+  // ============================================================
+  // 3. Bass boost (receiver side — หมอ)
+  //    boost ความถี่ต่ำ 20-500Hz ก่อนเล่นออกหูฟัง
+  //    ชดเชย iOS HPF ที่ตัดความถี่ต่ำออก
+  // ============================================================
+  var _heartMode    = false;
+  var _bassBoostDb  = 15; // default boost level (dB)
+  var _bassFilters  = new Map(); // videoElement → {ctx, shelf, peak80, peak200}
+
+  window.setHeartMode = function (enabled) {
+    _heartMode = enabled;
+    if (enabled) { _applyBassBoostAll(); }
+    else { _removeBassBoostAll(); }
+  };
+
+  // ปรับ boost real-time (เรียกจาก slider ใน Flutter)
+  window.setHeartBoost = function (db) {
+    _bassBoostDb = db;
+    _bassFilters.forEach(function (f) {
+      f.shelf.gain.value  = db;
+      f.peak80.gain.value = db * 0.7;
+      f.peak200.gain.value = db * 0.5;
+    });
+  };
+
+  function _applyBassBoostAll() {
+    document.querySelectorAll('video').forEach(function (v) {
+      if (v.srcObject && v.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(v)) {
+        _applyBassBoost(v);
+      }
+    });
+  }
+
+  function _applyBassBoost(videoEl) {
+    try {
+      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      ctx.resume();
+      var src   = ctx.createMediaStreamSource(videoEl.srcObject);
+      var shelf = ctx.createBiquadFilter();
+      shelf.type = 'lowshelf'; shelf.frequency.value = 500; shelf.gain.value = _bassBoostDb;
+      var peak80 = ctx.createBiquadFilter();
+      peak80.type = 'peaking'; peak80.frequency.value = 80; peak80.Q.value = 0.7; peak80.gain.value = _bassBoostDb * 0.7;
+      var peak200 = ctx.createBiquadFilter();
+      peak200.type = 'peaking'; peak200.frequency.value = 200; peak200.Q.value = 0.7; peak200.gain.value = _bassBoostDb * 0.5;
+      src.connect(shelf); shelf.connect(peak80); peak80.connect(peak200); peak200.connect(ctx.destination);
+      videoEl.muted = true;
+      _bassFilters.set(videoEl, { ctx: ctx, shelf: shelf, peak80: peak80, peak200: peak200 });
+      console.log('[BassBoost] ✅ applied ' + _bassBoostDb + 'dB');
+    } catch (e) { console.error('[BassBoost] error:', e); }
+  }
+
+  function _removeBassBoostAll() {
+    _bassFilters.forEach(function (f, videoEl) {
+      f.ctx.close().catch(function(){});
+      videoEl.muted = false; videoEl.play().catch(function(){});
+    });
+    _bassFilters.clear();
+  }
+
+  setInterval(function () {
+    if (!_heartMode) return;
+    document.querySelectorAll('video').forEach(function (v) {
+      if (v.srcObject && v.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(v)) {
+        _applyBassBoost(v);
+      }
+    });
+  }, 800);
+
+  // ============================================================
+  // 5. Reference sound player (หมอเปรียบเทียบกับเสียงปกติ)
+  // ============================================================
+  var _refAudio = null;
+
+  window.playReference = function (assetPath) {
+    if (_refAudio) { _refAudio.pause(); _refAudio = null; }
+    var url = new URL('assets/' + assetPath, window.location.href).href;
+    _refAudio = new Audio(url);
+    _refAudio.loop = true;
+    _refAudio.play().catch(function (e) { console.error('[Ref]', e); });
+  };
+
+  window.stopReference = function () {
+    if (_refAudio) { _refAudio.pause(); _refAudio = null; }
+  };
+
+  // ============================================================
+  // 4. iOS Safari audio unlock
+  // ============================================================
+  var _audioUnlocked = false;
+
+  function unlockAudio() {
+    if (_audioUnlocked) return;
+    _audioUnlocked = true;
+    try {
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      if (Ctx) new Ctx().resume();
+    } catch(e) {}
+    document.querySelectorAll('video').forEach(function (v) {
+      v.muted = false;
+      v.play().catch(function(){});
+    });
+    var el = document.getElementById('audio-unlock-overlay');
+    if (el) { el.style.opacity = '0'; setTimeout(function(){ el.classList.remove('show'); }, 300); }
+  }
+
+  if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+    setTimeout(function () {
+      var el = document.getElementById('audio-unlock-overlay');
+      if (el) el.classList.add('show');
+    }, 3000);
+  }
+
+  document.getElementById('audio-unlock-overlay').addEventListener('click', function(e) {
+    e.stopPropagation(); unlockAudio();
+  });
+  document.addEventListener('touchstart', unlockAudio, { passive: true });
+  document.addEventListener('click', unlockAudio);
+
+  var _vidObserver = new MutationObserver(function () {
+    if (!_audioUnlocked) return;
+    document.querySelectorAll('video').forEach(function (v) {
+      if (v.srcObject && v.paused) v.play().catch(function(){});
+    });
+  });
+  _vidObserver.observe(document.body, { childList: true, subtree: true, attributes: true });
+  </script>
+
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

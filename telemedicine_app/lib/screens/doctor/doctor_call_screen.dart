@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../services/webrtc_service.dart';
 import '../../services/audio_service.dart';
 import '../../services/recording_service.dart';
+import '../../services/_audio_js_stub.dart'
+    if (dart.library.js_interop) '../../services/_audio_js_web.dart';
 import '../../models/call_state.dart';
 import '../../widgets/video_view.dart';
 
@@ -140,6 +143,8 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 
           final isConnected = webrtc.callState == CallState.connected;
           final isHeart = audio.mode == ListeningMode.heartSound;
+          // มือถือ: หน้าจอแคบ (phone/tablet in portrait)
+          final isMobile = MediaQuery.of(context).size.shortestSide < 600;
 
           return Scaffold(
             backgroundColor: isHeart ? const Color(0xFF1A0A0A) : Colors.black,
@@ -194,7 +199,11 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 
                 // Heart mode overlay
                 if (isConnected && isHeart)
-                  _HeartModeOverlay(isRecording: rec.isRecording),
+                  _HeartModeOverlay(
+                    isRecording: rec.isRecording,
+                    selectedPosition: _recPosition,
+                    onPositionChanged: (pos) => setState(() => _recPosition = pos),
+                  ),
 
                 // Mode toggle
                 if (isConnected)
@@ -244,6 +253,13 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                         if (mounted) Navigator.pop(context);
                       },
                     ),
+                  ),
+
+                // มือถือ: แจ้งเตือนหูฟัง + tap to activate audio
+                if (isConnected && isMobile)
+                  const Positioned(
+                    top: 70, left: 0, right: 0,
+                    child: _MobileAudioHint(),
                   ),
 
                 // Error
@@ -402,7 +418,14 @@ class _SeekBar extends StatelessWidget {
 
 class _HeartModeOverlay extends StatefulWidget {
   final bool isRecording;
-  const _HeartModeOverlay({required this.isRecording});
+  final HeartPosition selectedPosition;
+  final ValueChanged<HeartPosition> onPositionChanged;
+
+  const _HeartModeOverlay({
+    required this.isRecording,
+    required this.selectedPosition,
+    required this.onPositionChanged,
+  });
 
   @override
   State<_HeartModeOverlay> createState() => _HeartModeOverlayState();
@@ -410,52 +433,332 @@ class _HeartModeOverlay extends StatefulWidget {
 
 class _HeartModeOverlayState extends State<_HeartModeOverlay>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl;
-  late final Animation<double> _pulse;
+  late final AnimationController _pulse;
+  Timer? _timer;
+  int _seconds = 0;
+  double _boostDb = 15;
+  bool _isPlayingRef = false;
 
   @override
   void initState() {
     super.initState();
-    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 700))
-      ..repeat(reverse: true);
-    _pulse = Tween(begin: 0.85, end: 1.0).animate(
-        CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut));
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    )..repeat(reverse: true);
+
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => _seconds++);
+    });
   }
 
   @override
   void dispose() {
-    _ctrl.dispose();
+    _pulse.dispose();
+    _timer?.cancel();
+    stopReference();
     super.dispose();
+  }
+
+  String get _timerLabel {
+    final m = (_seconds ~/ 60).toString().padLeft(2, '0');
+    final s = (_seconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  void _toggleReference() {
+    setState(() => _isPlayingRef = !_isPlayingRef);
+    if (_isPlayingRef) {
+      final asset = widget.selectedPosition.assetPath('best');
+      playReference(asset);
+    } else {
+      stopReference();
+    }
+  }
+
+  // หยุด reference เมื่อเปลี่ยนตำแหน่ง
+  void _changePosition(HeartPosition pos) {
+    if (_isPlayingRef) {
+      stopReference();
+      setState(() => _isPlayingRef = false);
+    }
+    widget.onPositionChanged(pos);
   }
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          ScaleTransition(
-            scale: _pulse,
-            child: Icon(
-              Icons.favorite,
-              color: widget.isRecording ? Colors.redAccent : const Color(0xFFEF5350),
-              size: 80,
+    final color = widget.isRecording ? Colors.redAccent : const Color(0xFFEF5350);
+
+    return Positioned.fill(
+      child: SafeArea(
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 60, 20, 110),
+            child: Column(
+              children: [
+                // ── Heart icon + timer ──
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    ScaleTransition(
+                      scale: Tween(begin: 0.85, end: 1.0).animate(
+                        CurvedAnimation(parent: _pulse, curve: Curves.easeInOut),
+                      ),
+                      child: Icon(Icons.favorite, color: color, size: 64),
+                    ),
+                    const SizedBox(width: 12),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          widget.isRecording ? 'กำลังบันทึก...' : 'กำลังฟังเสียงหัวใจ',
+                          style: TextStyle(
+                            color: color,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Row(
+                          children: [
+                            const Icon(Icons.timer_outlined, color: Colors.white54, size: 14),
+                            const SizedBox(width: 4),
+                            Text(
+                              _timerLabel,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 18,
+                                fontFeatures: [FontFeature.tabularFigures()],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 16),
+                _AnimatedWaveform(isRecording: widget.isRecording),
+                const SizedBox(height: 20),
+
+                // ── Position selector ──
+                _SectionLabel(label: 'ตำแหน่งฟัง'),
+                const SizedBox(height: 8),
+                _PositionSelector(
+                  selected: widget.selectedPosition,
+                  onChanged: _changePosition,
+                ),
+
+                const SizedBox(height: 20),
+
+                // ── Bass boost slider ──
+                _SectionLabel(label: 'เพิ่มความถี่ต่ำ (Bass Boost)'),
+                const SizedBox(height: 6),
+                _BoostSlider(
+                  value: _boostDb,
+                  onChanged: (v) {
+                    setState(() => _boostDb = v);
+                    setHeartBoost(v);
+                  },
+                ),
+
+                const SizedBox(height: 20),
+
+                // ── Reference sound ──
+                _SectionLabel(label: 'เสียงอ้างอิง (เปรียบเทียบ)'),
+                const SizedBox(height: 8),
+                _ReferenceButton(
+                  position: widget.selectedPosition,
+                  isPlaying: _isPlayingRef,
+                  onTap: _toggleReference,
+                ),
+
+                const SizedBox(height: 8),
+                const Text(
+                  '🎧 แนะนำใช้หูฟัง — เสียงหัวใจ 20–500 Hz',
+                  style: TextStyle(color: Colors.white38, fontSize: 11),
+                  textAlign: TextAlign.center,
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 16),
-          Text(
-            widget.isRecording ? 'กำลังบันทึก...' : 'กำลังฟังเสียงหัวใจ',
-            style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Section label ──
+class _SectionLabel extends StatelessWidget {
+  final String label;
+  const _SectionLabel({required this.label});
+  @override
+  Widget build(BuildContext context) => Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white54,
+            fontSize: 11,
+            letterSpacing: 0.5,
           ),
-          const SizedBox(height: 8),
-          const Text('ใช้หูฟัง over-ear เพื่อคุณภาพที่ดีที่สุด',
-              style: TextStyle(color: Colors.white54, fontSize: 13)),
-          const SizedBox(height: 4),
-          const Text('เสียงหัวใจ: 20–500 Hz',
-              style: TextStyle(color: Colors.redAccent, fontSize: 12)),
-          const SizedBox(height: 24),
-          _AnimatedWaveform(isRecording: widget.isRecording),
-        ],
+        ),
+      );
+}
+
+// ── Position selector: 4 chips A/M/P/T ──
+class _PositionSelector extends StatelessWidget {
+  final HeartPosition selected;
+  final ValueChanged<HeartPosition> onChanged;
+  const _PositionSelector({required this.selected, required this.onChanged});
+
+  static const _labels = {
+    HeartPosition.aortic:    ('A', 'Aortic'),
+    HeartPosition.mitral:    ('M', 'Mitral'),
+    HeartPosition.pulmonary: ('P', 'Pulmonary'),
+    HeartPosition.tricuspid: ('T', 'Tricuspid'),
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: HeartPosition.values.map((pos) {
+        final (short, full) = _labels[pos]!;
+        final isSelected = pos == selected;
+        return Expanded(
+          child: GestureDetector(
+            onTap: () => onChanged(pos),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              margin: const EdgeInsets.symmetric(horizontal: 4),
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              decoration: BoxDecoration(
+                color: isSelected
+                    ? const Color(0xFFEF5350).withValues(alpha: 0.85)
+                    : Colors.white.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: isSelected ? const Color(0xFFEF5350) : Colors.white12,
+                ),
+              ),
+              child: Column(
+                children: [
+                  Text(short,
+                      style: TextStyle(
+                        color: isSelected ? Colors.white : Colors.white54,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      )),
+                  Text(full,
+                      style: TextStyle(
+                        color: isSelected ? Colors.white70 : Colors.white30,
+                        fontSize: 9,
+                      )),
+                ],
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+}
+
+// ── Bass boost slider ──
+class _BoostSlider extends StatelessWidget {
+  final double value;
+  final ValueChanged<double> onChanged;
+  const _BoostSlider({required this.value, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 3,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+            activeTrackColor: const Color(0xFFEF5350),
+            inactiveTrackColor: Colors.white12,
+            thumbColor: Colors.white,
+          ),
+          child: Slider(
+            value: value,
+            min: 0,
+            max: 24,
+            divisions: 24,
+            onChanged: onChanged,
+          ),
+        ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text('ปกติ', style: TextStyle(color: Colors.white38, fontSize: 10)),
+            Text(
+              '+${value.toStringAsFixed(0)} dB',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const Text('สูงสุด', style: TextStyle(color: Colors.white38, fontSize: 10)),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+// ── Reference sound button ──
+class _ReferenceButton extends StatelessWidget {
+  final HeartPosition position;
+  final bool isPlaying;
+  final VoidCallback onTap;
+  const _ReferenceButton({
+    required this.position,
+    required this.isPlaying,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+        decoration: BoxDecoration(
+          color: isPlaying
+              ? Colors.green.withValues(alpha: 0.25)
+              : Colors.white.withValues(alpha: 0.06),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: isPlaying ? Colors.greenAccent : Colors.white12,
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              isPlaying ? Icons.stop_circle_outlined : Icons.play_circle_outline,
+              color: isPlaying ? Colors.greenAccent : Colors.white54,
+              size: 22,
+            ),
+            const SizedBox(width: 10),
+            Text(
+              isPlaying
+                  ? 'หยุดเสียงอ้างอิง'
+                  : 'ฟังเสียง ${position.label} ปกติ (เปรียบเทียบ)',
+              style: TextStyle(
+                color: isPlaying ? Colors.greenAccent : Colors.white70,
+                fontSize: 13,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -803,6 +1106,65 @@ class _Btn extends StatelessWidget {
           const SizedBox(height: 4),
           Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11)),
         ],
+      ),
+    );
+  }
+}
+
+// ==================== Mobile Audio Hint ====================
+
+/// แจ้งเตือนสำหรับมือถือ: iOS Safari ต้องการ gesture เพื่อเปิดเสียง
+/// และต้องใช้หูฟังเพื่อได้ยินเสียงหัวใจ (ลำโพงมือถือไม่มี bass)
+class _MobileAudioHint extends StatefulWidget {
+  const _MobileAudioHint();
+
+  @override
+  State<_MobileAudioHint> createState() => _MobileAudioHintState();
+}
+
+class _MobileAudioHintState extends State<_MobileAudioHint> {
+  bool _dismissed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // ซ่อนอัตโนมัติหลัง 8 วินาที
+    Future.delayed(const Duration(seconds: 8), () {
+      if (mounted) setState(() => _dismissed = true);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_dismissed) return const SizedBox.shrink();
+    return Center(
+      child: GestureDetector(
+        onTap: () => setState(() => _dismissed = true),
+        child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 20),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.75),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.amber.withValues(alpha: 0.6)),
+          ),
+          child: const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.headphones, color: Colors.amber, size: 18),
+              SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  'ใช้หูฟัง + แตะหน้าจอเพื่อเปิดเสียง',
+                  style: TextStyle(color: Colors.amber, fontSize: 12),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+              SizedBox(width: 8),
+              Icon(Icons.close, color: Colors.white38, size: 14),
+            ],
+          ),
+        ),
       ),
     );
   }

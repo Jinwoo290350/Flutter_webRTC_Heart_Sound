@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:audio_session/audio_session.dart';
 import '../config/webrtc_config.dart';
 import '../config/firebase_config.dart';
 import '../models/call_state.dart';
@@ -76,6 +77,43 @@ class WebRTCService extends ChangeNotifier {
     }
   }
 
+  // ==================== Audio Session ====================
+
+  /// Configure AudioSession ก่อนเริ่ม call
+  /// iOS  → measurement mode: ปิด voice processing ทั้งหมด
+  /// Android → normal mode: ลด chance ที่ hardware AEC จะทำงาน
+  static Future<void> configureAudioSession() async {
+    // web ไม่มี native AudioSession
+    if (kIsWeb) return;
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(AudioSessionConfiguration(
+        // iOS: measurement mode ปิด AEC/NS/AGC ระดับ AVAudioSession
+        avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+        avAudioSessionCategoryOptions:
+            AVAudioSessionCategoryOptions.allowBluetooth |
+            AVAudioSessionCategoryOptions.allowBluetoothA2dp,
+        avAudioSessionMode: AVAudioSessionMode.measurement,
+        avAudioSessionRouteSharingPolicy:
+            AVAudioSessionRouteSharingPolicy.defaultPolicy,
+        avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
+
+        // Android: ใช้ media mode แทน communication mode
+        // communication mode บังคับ hardware AEC เปิดตลอด
+        androidAudioAttributes: const AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.unknown,
+          flags: AndroidAudioFlags.none,
+          usage: AndroidAudioUsage.media,
+        ),
+        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+        androidWillPauseWhenDucked: false,
+      ));
+      debugPrint('AudioSession: configured — iOS measurement / Android media mode');
+    } catch (e) {
+      debugPrint('AudioSession: configure error (non-fatal): $e');
+    }
+  }
+
   // ==================== Local Stream ====================
 
   Future<bool> initLocalStream() async {
@@ -129,6 +167,9 @@ class WebRTCService extends ChangeNotifier {
     _setState(CallState.calling);
 
     try {
+      debugPrint('>>> startCall: step 0 configureAudioSession');
+      await configureAudioSession();
+
       debugPrint('>>> startCall: step 1 initLocalStream');
       final ok = await initLocalStream();
       if (!ok) return null;
@@ -183,6 +224,7 @@ class WebRTCService extends ChangeNotifier {
     _setState(CallState.waiting);
 
     try {
+      await configureAudioSession();
       final ok = await initLocalStream();
       if (!ok) return false;
 

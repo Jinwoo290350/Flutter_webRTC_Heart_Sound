@@ -2,6 +2,8 @@ import 'package:flutter/foundation.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../config/webrtc_config.dart';
+import '_audio_js_stub.dart'
+    if (dart.library.js_interop) '_audio_js_web.dart';
 
 /// โหมดการฟังของหมอ
 enum ListeningMode { voice, heartSound }
@@ -76,6 +78,8 @@ class AudioService extends ChangeNotifier {
   void switchMode(ListeningMode newMode) {
     if (_mode == newMode) return;
     _mode = newMode;
+    // แจ้ง JS ให้เปิด/ปิด bass boost บน receiver
+    setHeartMode(newMode == ListeningMode.heartSound);
     notifyListeners();
   }
 
@@ -166,6 +170,7 @@ class AudioService extends ChangeNotifier {
   Future<void> toggleSimulation() async {
     if (isSimulating) {
       await _simPlayer.stop();
+      await stopSimAudio(); // หยุด inject WebRTC + คืน mic track
       _simAsset = null;
     } else {
       await _playSimulation();
@@ -176,9 +181,13 @@ class AudioService extends ChangeNotifier {
   Future<void> _playSimulation() async {
     final asset = _simPosition.assetPath(_simVariant);
     _simAsset = asset;
+    // เล่น local (ให้คนไข้ได้ยินด้วย)
     await _simPlayer.play(
       AssetSource(asset.replaceFirst('assets/', '')),
     );
+    // inject เข้า WebRTC track → หมอได้ยิน
+    // Flutter web วาง asset ที่ /assets/assets/... จึงต้องเพิ่ม prefix
+    await startSimAudio('assets/$asset');
   }
 
   @override
