@@ -230,13 +230,42 @@ dependencies:
   provider: ^6.0.0                # State management
 ```
 
+## Medical Audio Fidelity Requirements (CRITICAL)
+
+ระบบนี้เป็นงานทางการแพทย์ที่ต้องการความละเอียดสูงมาก — กฎเหล่านี้ห้ามละเมิดเด็ดขาด:
+
+### 1. ห้าม preprocess สัญญาณเสียงทุกรูปแบบ
+- Input (stethoscope) และ Output (หมอ) ต้องเป็นสัญญาณเดียวกัน ไม่ผ่านการแปลงใดๆ
+- **ห้ามเพิ่ม** equalization, compression, normalization, filtering ก่อนส่งข้อมูล
+- Bass boost (Web Audio API) เป็น **display aid** สำหรับลำโพงที่ไม่มี bass เท่านั้น ไม่ใช่ส่วนหนึ่งของสัญญาณที่ส่ง
+- Bass boost ต้อง **ปิดเป็น 0dB** เมื่อทำการ record เพื่อวิเคราะห์หรือเปรียบเทียบ
+
+### 2. Pipeline ที่ยอมรับได้
+```
+Stethoscope → ADC → [WebRTC Opus 48kHz fullband] → Internet → [Opus decode] → หมอ
+```
+- Opus encode/decode เป็น lossy compression ที่หลีกเลี่ยงไม่ได้บน web
+- ถ้า Opus quality ไม่เพียงพอ (bass loss > 6dB) → ต้องใช้ **DataChannel raw PCM** แทน
+
+### 3. การทดสอบ audio fidelity
+- เปรียบเทียบ input vs received ด้วย `audio_compare.py` โดย bass boost = 0dB
+- เกณฑ์ผ่าน: bass band loss (20–200 Hz) < 6 dB
+- ถ้า > 6 dB → investigate และแก้ไขก่อน deploy จริง
+
+### 4. DataChannel PCM fallback
+ถ้า WebRTC audio quality ไม่ผ่านเกณฑ์:
+- ส่ง raw PCM Float32Array ผ่าน WebRTC DataChannel
+- ไม่มี codec, ไม่มี filter, ไม่มี compression
+- ต้อง implement jitter buffer เอง
+
 ## Testing Checklist
 
 - [ ] Video call connects between 2 devices
 - [ ] Voice audio is clear with noise reduction
 - [ ] Stethoscope audio does NOT fade after 10 seconds (critical!)
 - [ ] Heart sounds audible through headphones on doctor side
-- [ ] Recording captures stethoscope audio only
+- [ ] Recording captures stethoscope audio only (bass boost = 0dB during capture)
+- [ ] audio_compare.py: bass loss < 6dB (medical fidelity threshold)
 - [ ] Playback works correctly
 - [ ] Works on Android physical device (not just emulator)
 - [ ] Stethoscope detected as audio input on tablet

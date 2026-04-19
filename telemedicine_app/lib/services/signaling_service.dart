@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../config/firebase_config.dart';
 
@@ -47,19 +48,22 @@ class SignalingService {
   /// Patient รอฟัง answer จาก doctor
   /// เมื่อ doctor อัปโหลด answer, callback จะถูกเรียก
   void listenForAnswer(Function(RTCSessionDescription) onAnswer) {
-    _roomRef!.snapshots().listen((snapshot) {
-      if (!snapshot.exists) return;
+    _roomRef!.snapshots().listen(
+      (snapshot) {
+        if (!snapshot.exists) return;
 
-      final data = snapshot.data() as Map<String, dynamic>;
-      if (data.containsKey(FirebaseConfig.answerField)) {
-        final answerData = data[FirebaseConfig.answerField];
-        final answer = RTCSessionDescription(
-          answerData['sdp'],
-          answerData['type'],
-        );
-        onAnswer(answer);
-      }
-    });
+        final data = snapshot.data() as Map<String, dynamic>;
+        if (data.containsKey(FirebaseConfig.answerField)) {
+          final answerData = data[FirebaseConfig.answerField];
+          final answer = RTCSessionDescription(
+            answerData['sdp'],
+            answerData['type'],
+          );
+          onAnswer(answer);
+        }
+      },
+      onError: (e) => debugPrint('[Signaling] listenForAnswer error: $e'),
+    );
   }
 
   // ==================== Doctor (Callee) ====================
@@ -116,19 +120,22 @@ class SignalingService {
     _roomRef!
         .collection('${role}_${FirebaseConfig.candidatesCollection}')
         .snapshots()
-        .listen((snapshot) {
-      for (final change in snapshot.docChanges) {
-        if (change.type == DocumentChangeType.added) {
-          final data = change.doc.data()!;
-          final candidate = RTCIceCandidate(
-            data['candidate'],
-            data['sdpMid'],
-            data['sdpMLineIndex'],
-          );
-          onCandidate(candidate);
+        .listen(
+      (snapshot) {
+        for (final change in snapshot.docChanges) {
+          if (change.type == DocumentChangeType.added) {
+            final data = change.doc.data()!;
+            final candidate = RTCIceCandidate(
+              data['candidate'],
+              data['sdpMid'],
+              data['sdpMLineIndex'],
+            );
+            onCandidate(candidate);
+          }
         }
-      }
-    });
+      },
+      onError: (e) => debugPrint('[Signaling] listenForRemoteCandidates error: $e'),
+    );
   }
 
   // ==================== Room Management ====================
@@ -143,12 +150,39 @@ class SignalingService {
 
   /// ฟัง status ของ room (ตรวจว่าอีกฝ่ายวางสายหรือเปล่า)
   void listenForRoomStatus(Function(String) onStatusChange) {
-    _roomRef?.snapshots().listen((snapshot) {
-      if (!snapshot.exists) return;
-      final data = snapshot.data() as Map<String, dynamic>;
-      final status = data[FirebaseConfig.statusField] as String?;
-      if (status != null) onStatusChange(status);
+    _roomRef?.snapshots().listen(
+      (snapshot) {
+        if (!snapshot.exists) return;
+        final data = snapshot.data() as Map<String, dynamic>;
+        final status = data[FirebaseConfig.statusField] as String?;
+        if (status != null) onStatusChange(status);
+      },
+      onError: (e) => debugPrint('[Signaling] listenForRoomStatus error: $e'),
+    );
+  }
+
+  /// Patient ส่งสัญญาณ heartMode ไปยัง doctor ผ่าน Firestore
+  /// [enabled]: true = เริ่ม heart mode, false = หยุด
+  Future<void> setHeartMode(bool enabled) async {
+    if (_roomRef == null) return;
+    await _roomRef!.update({
+      'heartMode': enabled,
+      'heartModeAt': enabled ? FieldValue.serverTimestamp() : null,
     });
+    debugPrint('[Signaling] heartMode → $enabled');
+  }
+
+  /// Doctor ฟัง heartMode signal จาก patient
+  void listenForHeartMode(void Function(bool enabled) onChanged) {
+    _roomRef?.snapshots().listen(
+      (snapshot) {
+        if (!snapshot.exists) return;
+        final data = snapshot.data() as Map<String, dynamic>;
+        final val = data['heartMode'];
+        if (val is bool) onChanged(val);
+      },
+      onError: (e) => debugPrint('[Signaling] listenForHeartMode error: $e'),
+    );
   }
 
   void reset() {

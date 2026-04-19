@@ -8,6 +8,12 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+configurations.all {
+    // Fix: mergeJavaResource VerifyException caused by listenablefuture-9999.0 empty marker JAR
+    // guava already includes ListenableFuture, so exclude the empty conflict-avoidance stub
+    exclude(group = "com.google.guava", module = "listenablefuture")
+}
+
 android {
     namespace = "com.mtec.telemedicine_app"
     compileSdk = flutter.compileSdkVersion
@@ -38,6 +44,15 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    packaging {
+        resources {
+            // Fix: mergeJavaResource VerifyException — exclude all conflicting META-INF
+            excludes += "/META-INF/**"
+            excludes += "/*.kotlin_module"
+            excludes += "/kotlin/**"
         }
     }
 }

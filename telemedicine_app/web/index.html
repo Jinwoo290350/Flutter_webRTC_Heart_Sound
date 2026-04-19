@@ -165,7 +165,7 @@
   //    ชดเชย iOS HPF ที่ตัดความถี่ต่ำออก
   // ============================================================
   var _heartMode    = false;
-  var _bassBoostDb  = 15; // default boost level (dB)
+  var _bassBoostDb  = 8; // default boost level (dB) — ลดจาก 15 เพราะ Android clipping
   var _bassFilters  = new Map(); // videoElement → {ctx, shelf, peak80, peak200}
 
   window.setHeartMode = function (enabled) {
@@ -203,7 +203,14 @@
       peak80.type = 'peaking'; peak80.frequency.value = 80; peak80.Q.value = 0.7; peak80.gain.value = _bassBoostDb * 0.7;
       var peak200 = ctx.createBiquadFilter();
       peak200.type = 'peaking'; peak200.frequency.value = 200; peak200.Q.value = 0.7; peak200.gain.value = _bassBoostDb * 0.5;
-      src.connect(shelf); shelf.connect(peak80); peak80.connect(peak200); peak200.connect(ctx.destination);
+      // Limiter — ป้องกัน clipping บน Android speaker ที่รับ bass boost ไม่ไหว
+      var limiter = ctx.createDynamicsCompressor();
+      limiter.threshold.value = -3;   // เริ่ม compress ที่ -3 dBFS
+      limiter.knee.value      = 0;    // hard knee = limiter behavior
+      limiter.ratio.value     = 20;   // 20:1 = กด signal ที่เกิน threshold แทบไม่ผ่าน
+      limiter.attack.value    = 0.001;
+      limiter.release.value   = 0.1;
+      src.connect(shelf); shelf.connect(peak80); peak80.connect(peak200); peak200.connect(limiter); limiter.connect(ctx.destination);
       videoEl.muted = true;
       _bassFilters.set(videoEl, { ctx: ctx, shelf: shelf, peak80: peak80, peak200: peak200 });
       console.log('[BassBoost] ✅ applied ' + _bassBoostDb + 'dB');
@@ -243,6 +250,277 @@
   window.stopReference = function () {
     if (_refAudio) { _refAudio.pause(); _refAudio = null; }
   };
+
+  // ==================== JS-side Recording ====================
+  // record จาก remote video element โดยตรง (ไม่ผ่าน flutter_webrtc MediaRecorder)
+  var _jsRecorder   = null;
+  var _jsChunks     = [];
+  var _jsRecResolve = null;
+
+  window.startJsRecording = function () {
+    return new Promise(function (resolve, reject) {
+      // ดึง remote audio tracks จาก RTCPeerConnection โดยตรง (ไม่พึ่ง DOM video element)
+      var pcs = window._pcs || [];
+      console.log('[JsRec] _pcs count:', pcs.length);
+
+      var audioStream = new MediaStream();
+      pcs.forEach(function (pc, pi) {
+        var receivers = pc.getReceivers();
+        console.log('[JsRec] pc[' + pi + '] receivers:', receivers.length);
+        receivers.forEach(function (receiver) {
+          if (receiver.track && receiver.track.kind === 'audio') {
+            audioStream.addTrack(receiver.track);
+            console.log('[JsRec] pc[' + pi + '] → added audio track id=' + receiver.track.id
+                        + ' enabled=' + receiver.track.enabled
+                        + ' readyState=' + receiver.track.readyState);
+          }
+        });
+      });
+
+      var trackCount = audioStream.getAudioTracks().length;
+      console.log('[JsRec] total remote audio tracks collected:', trackCount);
+
+      if (trackCount === 0) {
+        console.error('[JsRec] ❌ no remote audio tracks — call not connected yet or _pcs empty');
+        reject('no remote audio tracks found');
+        return;
+      }
+
+      // mimeType fallback chain: opus → plain webm → no constraint
+      var mimeType = '';
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus';
+      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+        mimeType = 'audio/webm';
+      } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+        mimeType = 'audio/ogg;codecs=opus';
+      }
+      console.log('[JsRec] mimeType selected:', mimeType || '(browser default)');
+
+      _jsChunks     = [];
+      _jsRecResolve = resolve;
+      try {
+        _jsRecorder = mimeType
+          ? new MediaRecorder(audioStream, { mimeType: mimeType })
+          : new MediaRecorder(audioStream);
+      } catch (e) {
+        console.error('[JsRec] MediaRecorder init error:', e);
+        reject('MediaRecorder init failed: ' + e);
+        return;
+      }
+
+      _jsRecorder.ondataavailable = function (e) {
+        if (e.data && e.data.size > 0) _jsChunks.push(e.data);
+      };
+      _jsRecorder.onstop = function () {
+        var blobType = mimeType || 'audio/webm';
+        var blob     = new Blob(_jsChunks, { type: blobType });
+        var blobUrl  = URL.createObjectURL(blob);
+        console.log('[JsRec] ■ stopped blobUrl=' + blobUrl + ' size=' + blob.size + ' chunks=' + _jsChunks.length);
+        if (_jsRecResolve) { _jsRecResolve(blobUrl); _jsRecResolve = null; }
+      };
+      _jsRecorder.onerror = function (e) {
+        console.error('[JsRec] MediaRecorder error:', e);
+        if (_jsRecResolve) { _jsRecResolve(''); _jsRecResolve = null; }
+      };
+      _jsRecorder.start(100);
+      console.log('[JsRec] ▶ started mimeType=' + (mimeType || 'browser-default') + ' tracks=' + trackCount);
+    });
+  };
+
+  window.stopJsRecording = function () {
+    if (_jsRecorder && _jsRecorder.state !== 'inactive') {
+      _jsRecorder.stop();
+      _jsRecorder = null;
+    }
+  };
+
+  // ดาวน์โหลด recording blob URL — เรียกจาก Flutter
+  window.downloadRecording = function (blobUrl, filename) {
+    var a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename || 'heart_sound.webm';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  // ============================================================
+  // 6. DataChannel raw PCM — 0 dB loss heart sound streaming
+  //    Patient : AudioWorklet → Float32 20ms chunks → DataChannel
+  //    Doctor  : DataChannel → jitter buffer → Web Audio playback
+  // ============================================================
+
+  // AudioWorklet processor (loaded via Blob URL — no separate file needed)
+  var _pcmWorkletSrc = [
+    "class StethCapture extends AudioWorkletProcessor {",
+    "  constructor() { super(); this._buf = new Float32Array(960); this._pos = 0; }",
+    "  process(inputs) {",
+    "    var ch = inputs[0] && inputs[0][0];",
+    "    if (!ch) return true;",
+    "    for (var i = 0; i < ch.length; i++) {",
+    "      this._buf[this._pos++] = ch[i];",
+    "      if (this._pos === 960) {",       // 20 ms @ 48 kHz
+    "        this.port.postMessage(this._buf.buffer, [this._buf.buffer]);",
+    "        this._buf = new Float32Array(960); this._pos = 0;",
+    "      }",
+    "    }",
+    "    return true;",
+    "  }",
+    "}",
+    "registerProcessor('steth-capture', StethCapture);"
+  ].join('\n');
+
+  var _pcmCaptureCtx  = null;
+  var _pcmCaptureNode = null;
+  var _pcmChannel     = null; // RTCDataChannel — set by interceptor
+
+  // ─── Patient side ────────────────────────────────────────────
+  window.startPcmCapture = async function (deviceId) {
+    try {
+      if (_pcmCaptureCtx) { await _pcmCaptureCtx.close(); _pcmCaptureCtx = null; }
+
+      var constraints = {
+        audio: {
+          echoCancellation:   { exact: false },
+          noiseSuppression:   { exact: false },
+          autoGainControl:    { exact: false },
+          googHighpassFilter:     false,
+          googNoiseSuppression:   false,
+          googAutoGainControl:    false,
+          googEchoCancellation:   false,
+          sampleRate: 48000,
+        },
+        video: false,
+      };
+      if (deviceId) constraints.audio.deviceId = { exact: deviceId };
+
+      var stream = await navigator.mediaDevices.getUserMedia(constraints);
+      var ctx    = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 48000, latencyHint: 'interactive',
+      });
+      await ctx.resume();
+
+      var blob = new Blob([_pcmWorkletSrc], { type: 'application/javascript' });
+      var blobUrl = URL.createObjectURL(blob);
+      await ctx.audioWorklet.addModule(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+
+      var src  = ctx.createMediaStreamSource(stream);
+      var node = new AudioWorkletNode(ctx, 'steth-capture');
+
+      node.port.onmessage = function (e) {
+        if (_pcmChannel && _pcmChannel.readyState === 'open') {
+          _pcmChannel.send(e.data); // ArrayBuffer Float32LE 960 samples
+        }
+      };
+
+      src.connect(node);
+      node.connect(ctx.destination); // Safari requires connection to destination
+
+      _pcmCaptureCtx  = ctx;
+      _pcmCaptureNode = node;
+      console.log('[PCM] ▶ capture started  deviceId=' + (deviceId || 'default'));
+    } catch (e) {
+      console.error('[PCM] capture error:', e);
+      throw e;
+    }
+  };
+
+  window.stopPcmCapture = async function () {
+    if (_pcmCaptureNode) { _pcmCaptureNode.disconnect(); _pcmCaptureNode = null; }
+    if (_pcmCaptureCtx)  { await _pcmCaptureCtx.close(); _pcmCaptureCtx  = null; }
+    console.log('[PCM] ■ capture stopped');
+  };
+
+  // ─── Doctor side ─────────────────────────────────────────────
+  var _pcmPlayCtx   = null;
+  var _pcmNextTime  = 0;
+  var _pcmStarted   = false;
+  var _pcmQueue     = [];
+  var _CHUNK_DUR    = 960 / 48000;  // 0.02 s
+  var _JITTER       = 3;            // buffer 3 chunks (60 ms) before first play
+
+  window.startPcmPlayback = function (dataChannel) {
+    _pcmChannel = dataChannel;
+    _pcmQueue   = [];
+    _pcmStarted = false;
+
+    if (!_pcmPlayCtx || _pcmPlayCtx.state === 'closed') {
+      _pcmPlayCtx = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 48000, latencyHint: 'interactive',
+      });
+    }
+    _pcmPlayCtx.resume();
+
+    dataChannel.binaryType = 'arraybuffer';
+    dataChannel.onmessage = function (e) {
+      _pcmQueue.push(new Float32Array(e.data));
+
+      if (!_pcmStarted && _pcmQueue.length >= _JITTER) {
+        _pcmStarted  = true;
+        _pcmNextTime = _pcmPlayCtx.currentTime + 0.010; // 10 ms warmup
+      }
+
+      if (_pcmStarted) {
+        while (_pcmQueue.length > 0) {
+          var samples = _pcmQueue.shift();
+          var buf = _pcmPlayCtx.createBuffer(1, samples.length, 48000);
+          buf.getChannelData(0).set(samples);
+          var src = _pcmPlayCtx.createBufferSource();
+          src.buffer = buf;
+          src.connect(_pcmPlayCtx.destination);
+          var t = Math.max(_pcmNextTime, _pcmPlayCtx.currentTime);
+          src.start(t);
+          _pcmNextTime = t + _CHUNK_DUR;
+        }
+      }
+    };
+    dataChannel.onclose = function () {
+      console.log('[PCM] DataChannel closed — playback ended');
+      _pcmStarted = false; _pcmQueue = [];
+    };
+    console.log('[PCM] ▶ playback ready — waiting for chunks...');
+  };
+
+  window.stopPcmPlayback = function () {
+    if (_pcmPlayCtx) { _pcmPlayCtx.close().catch(function(){}); _pcmPlayCtx = null; }
+    _pcmQueue   = [];
+    _pcmStarted = false;
+    console.log('[PCM] ■ playback stopped');
+  };
+
+  // ─── DataChannel interceptor (ฝังใน PatchedPC) ──────────────
+  // เพิ่มใน PatchedPC เพื่อ intercept DataChannel อัตโนมัติ
+  (function () {
+    var _OrigPC = window.RTCPeerConnection;
+    function PatchedPC2(config) {
+      var pc = new _OrigPC(config);
+      // Patient side — intercept createDataChannel
+      var _origCreate = pc.createDataChannel.bind(pc);
+      pc.createDataChannel = function (label, opts) {
+        var dc = _origCreate(label, opts);
+        if (label === 'pcm-heart') {
+          _pcmChannel = dc;
+          dc.onopen  = function () { console.log('[PCM] DataChannel open (patient)'); };
+          dc.onerror = function (e) { console.error('[PCM] DataChannel error:', e); };
+        }
+        return dc;
+      };
+      // Doctor side — receive DataChannel
+      pc.ondatachannel = function (event) {
+        var dc = event.channel;
+        if (dc.label === 'pcm-heart') {
+          console.log('[PCM] DataChannel received (doctor)');
+          window.startPcmPlayback(dc);
+        }
+      };
+      return pc;
+    }
+    PatchedPC2.prototype = _OrigPC.prototype;
+    Object.assign(PatchedPC2, _OrigPC);
+    window.RTCPeerConnection = PatchedPC2;
+  })();
 
   // ============================================================
   // 4. iOS Safari audio unlock

@@ -22,6 +22,24 @@ external void _jsPlayReference(JSString path);
 @JS('stopReference')
 external void _jsStopReference();
 
+@JS('downloadRecording')
+external void _jsDownloadRecording(JSString blobUrl, JSString filename);
+
+@JS('startJsRecording')
+external JSPromise<JSString> _jsStartJsRecording();
+
+@JS('stopJsRecording')
+external void _jsStopJsRecording();
+
+@JS('startPcmCapture')
+external JSPromise _jsStartPcmCapture(JSString? deviceId);
+
+@JS('stopPcmCapture')
+external JSPromise _jsStopPcmCapture();
+
+@JS('stopPcmPlayback')
+external void _jsStopPcmPlayback();
+
 Future<void> startSimAudio(String path) async {
   try { await _jsStartSim(path.toJS).toDart; } catch (_) {}
 }
@@ -48,4 +66,31 @@ void playReference(String path) {
 
 void stopReference() {
   try { _jsStopReference(); } catch (_) {}
+}
+
+void downloadRecording(String blobUrl, String filename) {
+  try { _jsDownloadRecording(blobUrl.toJS, filename.toJS); } catch (_) {}
+}
+
+Future<String> startJsRecording() async {
+  try {
+    final result = await _jsStartJsRecording().toDart;
+    return result.toDart;  // JSString → Dart String (blob URL)
+  } catch (e) { return ''; }
+}
+
+void stopJsRecording() {
+  try { _jsStopJsRecording(); } catch (_) {}
+}
+
+Future<void> startPcmCapture({String? deviceId}) async {
+  try { await _jsStartPcmCapture(deviceId?.toJS).toDart; } catch (_) {}
+}
+
+Future<void> stopPcmCapture() async {
+  try { await _jsStopPcmCapture().toDart; } catch (_) {}
+}
+
+void stopPcmPlayback() {
+  try { _jsStopPcmPlayback(); } catch (_) {}
 }

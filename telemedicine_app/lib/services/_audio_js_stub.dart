@@ -6,3 +6,9 @@ Future<void> retrySimInject() async {}
 void setHeartBoost(double db) {}
 void playReference(String path) {}
 void stopReference() {}
+void downloadRecording(String blobUrl, String filename) {}
+Future<String> startJsRecording() async => '';
+void stopJsRecording() {}
+Future<void> startPcmCapture({String? deviceId}) async {}
+Future<void> stopPcmCapture() async {}
+void stopPcmPlayback() {}

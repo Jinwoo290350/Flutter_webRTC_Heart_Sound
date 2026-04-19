@@ -1,10 +1,16 @@
+import 'dart:io';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:share_plus/share_plus.dart';
 import '../../services/webrtc_service.dart';
 import '../../services/audio_service.dart';
 import '../../services/recording_service.dart';
+import '../../services/patient_recording_service.dart';
 import '../../services/_audio_js_stub.dart'
     if (dart.library.js_interop) '../../services/_audio_js_web.dart';
 import '../../models/call_state.dart';
@@ -28,9 +34,19 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   bool _micEnabled = true;
   bool _cameraEnabled = true;
   bool _showRecordings = false;
+  bool _showPatientRecordings = false;
 
   // ตำแหน่งที่กำลัง record (ให้ user เลือก)
   HeartPosition _recPosition = HeartPosition.aortic;
+
+  // Patient recordings จาก Firestore
+  final List<PatientRecording> _patientRecordings = [];
+  StreamSubscription? _patRecSub;
+  final AudioPlayer _patPlayer = AudioPlayer();
+  String? _playingPatRecId;
+
+  // Auto-record เมื่อ patient กด Heart Mode
+  bool _heartModeSub = false;
 
   @override
   void initState() {
@@ -43,8 +59,91 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
     await _remoteRenderer.initialize();
   }
 
+  /// ฟัง heartMode signal จาก patient — เรียกครั้งเดียวเมื่อ connected
+  void _listenHeartMode() {
+    if (_heartModeSub) return;
+    _heartModeSub = true;
+    final webrtc = context.read<WebRTCService>();
+    webrtc.signaling.listenForHeartMode((enabled) {
+      if (!mounted) return;
+      final webrtc2 = context.read<WebRTCService>();
+      // ตรวจ DataChannel state ก่อนส่งให้ startRecording
+      final dc = kIsWeb ? null : webrtc2.pcmChannel;
+      final dcReady = dc?.state == RTCDataChannelState.RTCDataChannelOpen;
+      if (!dcReady && dc != null) {
+        debugPrint('[DoctorScreen] PCM DataChannel not open (${dc.state}) — will fallback to AudioRecord');
+      }
+      if (enabled && !_rec.isRecording) {
+        _rec.startRecording(
+          _recPosition.label,
+          stream: webrtc2.remoteStream,
+          dataChannel: dcReady ? dc : null,
+        );
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(dcReady
+                ? '🔴 Auto-recording (PCM DataChannel)'
+                : '🔴 Auto-recording (Audio fallback)'),
+            duration: const Duration(seconds: 2),
+            backgroundColor: Colors.red,
+          ),
+        );
+      } else if (!enabled && _rec.isRecording) {
+        _rec.stopRecording(_recPosition.label);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('⏹ Auto-recording หยุดแล้ว'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    });
+  }
+
+  void _listenPatientRecordings(String roomId) {
+    _patRecSub?.cancel();
+    _patRecSub = FirebaseFirestore.instance
+        .collection('rooms')
+        .doc(roomId)
+        .collection('patient_recordings')
+        .orderBy('timestamp', descending: true)
+        .snapshots()
+        .listen((snap) {
+      final isFirst = _patientRecordings.isEmpty && snap.docs.isNotEmpty;
+      setState(() {
+        _patientRecordings
+          ..clear()
+          ..addAll(snap.docs.map(PatientRecording.fromFirestore));
+        if (isFirst) _showPatientRecordings = true;
+      });
+      if (isFirst && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('คนไข้อัพโหลด recording ใหม่แล้ว'),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    });
+  }
+
+  Future<void> _playPatRec(PatientRecording rec) async {
+    if (_playingPatRecId == rec.id) {
+      await _patPlayer.stop();
+      setState(() => _playingPatRecId = null);
+      return;
+    }
+    setState(() => _playingPatRecId = rec.id);
+    await _patPlayer.play(UrlSource(rec.url));
+    _patPlayer.onPlayerComplete.listen((_) {
+      if (mounted) setState(() => _playingPatRecId = null);
+    });
+  }
+
   @override
   void dispose() {
+    _patRecSub?.cancel();
+    _patPlayer.dispose();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
     _roomIdController.dispose();
@@ -91,13 +190,19 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   }
 
   void _toggleRecord() {
+    final webrtc = context.read<WebRTCService>();
     if (_rec.isRecording) {
       _rec.stopRecording(_recPosition.label);
     } else {
-      _showPositionPicker();
+      _rec.startRecording(
+        _recPosition.label,
+        stream: webrtc.remoteStream,
+        dataChannel: kIsWeb ? null : webrtc.pcmChannel,
+      );
     }
   }
 
+  // ignore: unused_element
   void _showPositionPicker() {
     final webrtc = context.read<WebRTCService>();
     showDialog(
@@ -116,7 +221,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                   setState(() => _recPosition = v!);
                   Navigator.pop(context);
                   // ส่ง remote stream เพื่อบันทึกเสียงหัวใจจริงจาก WebRTC
-                  _rec.startRecording(pos.label, stream: webrtc.remoteStream);
+                  _rec.startRecording(pos.label, stream: webrtc.remoteStream, dataChannel: kIsWeb ? null : webrtc.pcmChannel);
                 },
               ),
             );
@@ -143,8 +248,13 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 
           final isConnected = webrtc.callState == CallState.connected;
           final isHeart = audio.mode == ListeningMode.heartSound;
-          // มือถือ: หน้าจอแคบ (phone/tablet in portrait)
           final isMobile = MediaQuery.of(context).size.shortestSide < 600;
+
+          // เริ่ม listen patient recordings และ heart mode เมื่อ connected
+          if (isConnected && webrtc.roomId != null && _patRecSub == null) {
+            _listenPatientRecordings(webrtc.roomId!);
+          }
+          if (isConnected) _listenHeartMode();
 
           return Scaffold(
             backgroundColor: isHeart ? const Color(0xFF1A0A0A) : Colors.black,
@@ -153,7 +263,17 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
               backgroundColor: isHeart ? const Color(0xFF4A0000) : Colors.black87,
               foregroundColor: Colors.white,
               actions: [
-                // แสดงจำนวน recordings
+                // Patient recordings badge
+                if (_patientRecordings.isNotEmpty)
+                  IconButton(
+                    icon: Badge(
+                      label: Text('${_patientRecordings.length}'),
+                      child: const Icon(Icons.cloud_download, color: Colors.greenAccent),
+                    ),
+                    onPressed: () => setState(() => _showPatientRecordings = !_showPatientRecordings),
+                    tooltip: 'Patient Recordings',
+                  ),
+                // แสดงจำนวน recordings (web JS)
                 if (rec.recordings.isNotEmpty)
                   IconButton(
                     icon: Badge(
@@ -203,6 +323,8 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                     isRecording: rec.isRecording,
                     selectedPosition: _recPosition,
                     onPositionChanged: (pos) => setState(() => _recPosition = pos),
+                    pcmChannelReady: !kIsWeb &&
+                        webrtc.pcmChannel?.state == RTCDataChannelState.RTCDataChannelOpen,
                   ),
 
                 // Mode toggle
@@ -222,7 +344,18 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                     child: _RecordingIndicator(position: _recPosition.label),
                   ),
 
-                // Recordings list panel
+                // Patient recordings panel (from Firebase Storage)
+                if (_showPatientRecordings && _patientRecordings.isNotEmpty)
+                  Positioned(
+                    bottom: 100, left: 0, right: 0,
+                    child: _PatientRecordingsPanel(
+                      recordings: _patientRecordings,
+                      playingId: _playingPatRecId,
+                      onPlay: _playPatRec,
+                    ),
+                  ),
+
+                // Recordings list panel (web JS recording)
                 if (_showRecordings && rec.recordings.isNotEmpty)
                   Positioned(
                     bottom: 100, left: 0, right: 0,
@@ -249,6 +382,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                       onRecord: _toggleRecord,
                       onHangUp: () async {
                         if (rec.isRecording) await rec.cancelRecording();
+                        stopPcmPlayback(); // หยุด PCM playback ก่อน hang up
                         await webrtc.hangUp();
                         if (mounted) Navigator.pop(context);
                       },
@@ -280,6 +414,95 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
             ),
           );
         },
+      ),
+    );
+  }
+}
+
+// ==================== Patient Recordings Panel (Firebase Storage) ====================
+
+class _PatientRecordingsPanel extends StatelessWidget {
+  final List<PatientRecording> recordings;
+  final String? playingId;
+  final Future<void> Function(PatientRecording) onPlay;
+
+  const _PatientRecordingsPanel({
+    required this.recordings,
+    required this.playingId,
+    required this.onPlay,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 12),
+      constraints: const BoxConstraints(maxHeight: 260),
+      decoration: BoxDecoration(
+        color: Colors.black87,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              children: [
+                const Icon(Icons.cloud_download, color: Colors.greenAccent, size: 18),
+                const SizedBox(width: 8),
+                const Text('Recordings จากคนไข้',
+                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                const Spacer(),
+                Text('${recordings.length} รายการ',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              ],
+            ),
+          ),
+          const Divider(color: Colors.white12, height: 1),
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: recordings.length,
+              itemBuilder: (_, i) {
+                final r = recordings[i];
+                final isPlaying = playingId == r.id;
+                final h = r.timestamp.hour.toString().padLeft(2, '0');
+                final m = r.timestamp.minute.toString().padLeft(2, '0');
+                return ListTile(
+                  dense: true,
+                  leading: GestureDetector(
+                    onTap: () => onPlay(r),
+                    child: CircleAvatar(
+                      backgroundColor: isPlaying ? Colors.greenAccent : Colors.white12,
+                      child: Icon(
+                        isPlaying ? Icons.stop : Icons.play_arrow,
+                        color: isPlaying ? Colors.black : Colors.white,
+                        size: 20,
+                      ),
+                    ),
+                  ),
+                  title: Text(
+                    r.position,
+                    style: TextStyle(
+                      color: isPlaying ? Colors.greenAccent : Colors.white,
+                      fontSize: 13,
+                    ),
+                  ),
+                  subtitle: Text(
+                    '$h:$m · ${r.ext.toUpperCase()}',
+                    style: const TextStyle(color: Colors.white38, fontSize: 11),
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.download, color: Colors.white54, size: 18),
+                    tooltip: 'Download',
+                    onPressed: () => downloadRecording(r.url, 'heart_${r.position}_$h$m.${r.ext}'),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -363,12 +586,29 @@ class _RecordingsPanel extends StatelessWidget {
                   subtitle: isCurrent
                       ? _SeekBar(rec: rec)
                       : Text(
-                          _formatTime(r.timestamp),
-                          style: const TextStyle(color: Colors.white38, fontSize: 11),
+                          r.isAsset
+                              ? '⚠️ fallback sample (no stream)'
+                              : _formatTime(r.timestamp),
+                          style: TextStyle(
+                            color: r.isAsset ? Colors.orange : Colors.white38,
+                            fontSize: 11,
+                          ),
                         ),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.delete_outline, color: Colors.white38, size: 18),
-                    onPressed: () => rec.deleteRecording(r.id),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Download button — web=download, native=save to Downloads folder
+                      if (!r.isAsset)
+                        IconButton(
+                          icon: const Icon(Icons.download, color: Colors.white54, size: 18),
+                          tooltip: 'Save to Downloads',
+                          onPressed: () => _saveRecording(context, r),
+                        ),
+                      IconButton(
+                        icon: const Icon(Icons.delete_outline, color: Colors.white38, size: 18),
+                        onPressed: () => rec.deleteRecording(r.id),
+                      ),
+                    ],
                   ),
                 );
               },
@@ -377,6 +617,42 @@ class _RecordingsPanel extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _saveRecording(BuildContext context, HeartRecording r) async {
+    if (kIsWeb) {
+      final filename = 'heart_${r.position}_${r.timestamp.hour}${r.timestamp.minute}.webm';
+      downloadRecording(r.path, filename);
+      return;
+    }
+    try {
+      final src = File(r.path);
+      if (!await src.exists()) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('ไฟล์ถูกลบออกจากแคชแล้ว กรุณา record ใหม่')),
+          );
+        }
+        return;
+      }
+
+      final h = r.timestamp.hour.toString().padLeft(2, '0');
+      final m = r.timestamp.minute.toString().padLeft(2, '0');
+      final ext = r.path.endsWith('.m4a') ? 'm4a' : 'mp4';
+      final filename = 'heart_${r.position}_$h$m.$ext';
+
+      // เปิด share sheet — บันทึกไปที่ Drive, LINE, Files ฯลฯ ได้เลย
+      await Share.shareXFiles(
+        [XFile(r.path, mimeType: 'audio/mp4', name: filename)],
+        subject: filename,
+      );
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Share ไม่สำเร็จ: $e')),
+        );
+      }
+    }
   }
 
   String _formatTime(DateTime t) {
@@ -420,11 +696,13 @@ class _HeartModeOverlay extends StatefulWidget {
   final bool isRecording;
   final HeartPosition selectedPosition;
   final ValueChanged<HeartPosition> onPositionChanged;
+  final bool pcmChannelReady;
 
   const _HeartModeOverlay({
     required this.isRecording,
     required this.selectedPosition,
     required this.onPositionChanged,
+    this.pcmChannelReady = false,
   });
 
   @override
@@ -496,6 +774,30 @@ class _HeartModeOverlayState extends State<_HeartModeOverlay>
             padding: const EdgeInsets.fromLTRB(20, 60, 20, 110),
             child: Column(
               children: [
+                // ── PCM DataChannel indicator (native only) ──
+                if (!kIsWeb)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.circle,
+                          size: 10,
+                          color: widget.pcmChannelReady ? Colors.blueAccent : Colors.white38,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          widget.pcmChannelReady ? 'PCM DataChannel พร้อม' : 'PCM DataChannel ยังไม่เชื่อมต่อ',
+                          style: TextStyle(
+                            color: widget.pcmChannelReady ? Colors.blueAccent : Colors.white38,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
                 // ── Heart icon + timer ──
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audio_session/audio_session.dart';
@@ -25,12 +26,16 @@ class WebRTCService extends ChangeNotifier {
   MediaStream? _localStream;       // voice + video (filter ON)
   MediaStream? _stethStream;       // stethoscope (filter OFF) — Phase 2
   MediaStream? _remoteStream;
+  RTCDataChannel? _pcmChannel;     // raw PCM heart sound DataChannel
 
   MediaStream? get localStream => _localStream;
   MediaStream? get remoteStream => _remoteStream;
+  RTCDataChannel? get pcmChannel => _pcmChannel;
   bool get hasStethoscope => _stethStream != null;
 
   final SignalingService _signaling = SignalingService();
+  SignalingService get signaling => _signaling;
+  Timer? _iceDisconnectTimer;
 
   // ==================== Setup ====================
 
@@ -47,9 +52,15 @@ class WebRTCService extends ChangeNotifier {
     _peerConnection!.onIceConnectionState = (state) {
       debugPrint('ICE state: $state');
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
+        _iceDisconnectTimer?.cancel();
         _setState(CallState.connected);
-      } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
-                 state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+        // รอ 5 วินาที — WebRTC อาจ recover เองได้บนเน็ตไม่เสถียร
+        debugPrint('ICE disconnected — waiting 5s before hang up');
+        _iceDisconnectTimer?.cancel();
+        _iceDisconnectTimer = Timer(const Duration(seconds: 5), hangUp);
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        _iceDisconnectTimer?.cancel();
         hangUp();
       }
     };
@@ -74,6 +85,37 @@ class WebRTCService extends ChangeNotifier {
         _peerConnection!.addTrack(track, _stethStream!);
       }
       debugPrint('WebRTCService: added stethoscope track to PeerConnection');
+    }
+
+    // PCM DataChannel — caller (patient) creates, callee (doctor) receives via onDataChannel
+    // Web: JS interceptor handles playback automatically
+    // Native: ใช้ channel นี้ส่ง Float32 PCM chunks ตรงๆ
+    _peerConnection!.onDataChannel = (channel) {
+      if (channel.label == 'pcm-heart') {
+        _pcmChannel = channel;
+        debugPrint('WebRTCService: PCM DataChannel received (doctor side)');
+        notifyListeners();
+      }
+    };
+  }
+
+  /// สร้าง PCM DataChannel ฝั่ง patient (caller) — เรียกหลัง _createPeerConnection
+  Future<void> _createPcmChannel() async {
+    if (kIsWeb) return; // Web: JS interceptor จัดการเอง
+    try {
+      _pcmChannel = await _peerConnection!.createDataChannel(
+        'pcm-heart',
+        RTCDataChannelInit()
+          ..ordered = false     // ไม่ต้องการ ordered — latency สำคัญกว่า
+          ..maxRetransmits = 0, // ไม่ retry — เสียงเก่า drop ดีกว่า lag
+      );
+      _pcmChannel!.onDataChannelState = (state) {
+        debugPrint('WebRTCService: PCM DataChannel state=$state');
+        notifyListeners();
+      };
+      debugPrint('WebRTCService: PCM DataChannel created (patient side)');
+    } catch (e) {
+      debugPrint('WebRTCService: PCM DataChannel create error (non-fatal): $e');
     }
   }
 
@@ -176,6 +218,7 @@ class WebRTCService extends ChangeNotifier {
 
       debugPrint('>>> startCall: step 2 createPeerConnection');
       await _createPeerConnection();
+      await _createPcmChannel(); // patient สร้าง DataChannel ก่อน createOffer
 
       debugPrint('>>> startCall: step 3 createOffer');
       final offer = await _peerConnection!.createOffer({
@@ -287,6 +330,8 @@ class WebRTCService extends ChangeNotifier {
   }
 
   Future<void> hangUp() async {
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = null;
     _setState(CallState.ended);
     await _signaling.endRoom();
     await _localStream?.dispose();
@@ -322,6 +367,7 @@ class WebRTCService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _iceDisconnectTimer?.cancel();
     _localStream?.dispose();
     _stethStream?.dispose();
     _remoteStream?.dispose();

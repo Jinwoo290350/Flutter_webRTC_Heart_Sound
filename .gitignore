@@ -1,13 +1,31 @@
-# ===== Generated Analysis Files =====
+# ===== Generated Analysis Images =====
 heart_sound_metrics.png
 heart_sound_bands.png
 heart_sound_waveform.png
 heart_sound_analysis.csv
+result_waveform.png
+result_spectrum.png
+result_heatmap.png
+result_scores.png
+result_summary.png
+result_s1s2_main.png
 
-# ===== Heart Sound Data (ใหญ่เกินไปสำหรับ git) =====
+# ===== Audio Test Recordings (binary, ใหญ่เกินไปสำหรับ git) =====
+Test/
+*.webm
+*.m4a
+*.wav
+*.mp3
+*.ogg
+audio_compare.py
+
+# ===== Heart Sound Dataset =====
 Heart_sound/
 Heart sound/
 telemedicine_app/assets/heart_sounds/
+
+# ===== Claude AI memory / session files =====
+.claude/
 
 # ===== IDE History =====
 .history/

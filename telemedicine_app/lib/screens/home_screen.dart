@@ -16,7 +16,7 @@ class HomeScreen extends StatelessWidget {
         centerTitle: true,
       ),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -96,6 +96,7 @@ class HomeScreen extends StatelessWidget {
     );
   }
 }
+
 
 class _RoleButton extends StatelessWidget {
   final IconData icon;

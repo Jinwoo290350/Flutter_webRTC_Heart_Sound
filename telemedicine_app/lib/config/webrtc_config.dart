@@ -6,26 +6,36 @@
 class WebRTCConfig {
   // ==================== ICE Servers ====================
 
-  /// STUN server ของ Google (ฟรี, สำหรับ prototype)
-  /// ใช้เพื่อ NAT traversal — หา public IP ของแต่ละ peer
+  /// STUN + TURN servers
+  /// ใช้ Open Relay Project (ฟรี ไม่ต้องสมัคร) สำหรับ hospital firewall traversal
+  /// TURN จำเป็นเมื่อ hospital block P2P direct connection
   static const Map<String, dynamic> iceServers = {
     'iceServers': [
       {'urls': 'stun:stun.l.google.com:19302'},
       {'urls': 'stun:stun1.l.google.com:19302'},
+      // Open Relay Project — public TURN, no signup needed
+      {
+        'urls': [
+          'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:443',
+          'turns:openrelay.metered.ca:443', // ผ่าน HTTPS firewall ได้
+        ],
+        'username': 'openrelayproject',
+        'credential': 'openrelayproject',
+      },
     ],
   };
 
   // ==================== Audio Constraints ====================
 
   /// Phase 1: เสียงพูดทั่วไป — เปิด filter ปกติ
-  /// ใช้กับทั้ง patient และ doctor สำหรับการสื่อสาร
   static const Map<String, dynamic> voiceConstraints = {
     'audio': {
       'echoCancellation': true,
       'noiseSuppression': true,
       'autoGainControl': true,
     },
-    'video': true, // ใช้ true แทนเพื่อให้ทำงานได้ทั้ง web และ mobile
+    'video': true,
   };
 
   /// Phase 2 (เตรียมไว้): เสียงหัวใจ — ปิด filter ทั้งหมด
@@ -47,12 +57,23 @@ class WebRTCConfig {
 
   // ==================== SDP Manipulation ====================
 
-  /// Phase 2 (เตรียมไว้): บังคับ Opus fullband 48kHz
-  /// ป้องกัน Opus fall back เป็น narrowband (8kHz) เมื่อเจอ AEC/NS
-  static String forceOpusFullband(String sdp) {
-    return sdp.replaceAllMapped(
+  /// Modify SDP:
+  /// 1. บังคับ Opus fullband 48kHz — ป้องกัน fall back เป็น narrowband
+  /// 2. จำกัด video bandwidth 500 kbps — ให้ audio มี priority บนเน็ตช้า
+  static String modifySdp(String sdp) {
+    // Opus fullband 48kHz
+    String result = sdp.replaceAllMapped(
       RegExp(r'(a=fmtp:\d+ .*)'),
       (m) => '${m[1]};maxplaybackrate=48000;sprop-maxcapturerate=48000',
     );
+    // จำกัด video bitrate 500 kbps (เน็ตแย่ยังดูได้ audio ไม่แย่ง bandwidth)
+    result = result.replaceAllMapped(
+      RegExp(r'(m=video [^\r\n]*)'),
+      (m) => '${m[1]}\r\nb=AS:500',
+    );
+    return result;
   }
+
+  /// ชื่อเดิม — backward compat (alias ไป modifySdp)
+  static String forceOpusFullband(String sdp) => modifySdp(sdp);
 }

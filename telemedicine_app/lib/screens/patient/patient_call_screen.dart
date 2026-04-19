@@ -4,6 +4,9 @@ import 'package:provider/provider.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../services/webrtc_service.dart';
 import '../../services/audio_service.dart';
+import '../../services/patient_recording_service.dart';
+import '../../services/_audio_js_stub.dart'
+    if (dart.library.js_interop) '../../services/_audio_js_web.dart';
 import '../../models/call_state.dart';
 import '../../widgets/video_view.dart';
 
@@ -19,10 +22,13 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   final AudioService _audio = AudioService();
+  final PatientRecordingService _patRec = PatientRecordingService();
 
   bool _micEnabled = true;
   bool _cameraEnabled = true;
   bool _showSimPanel = false;
+  bool _pcmCapturing = false;
+  HeartPosition _recPosition = HeartPosition.aortic;
 
   @override
   void initState() {
@@ -40,6 +46,7 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
     _localRenderer.dispose();
     _remoteRenderer.dispose();
     _audio.dispose();
+    _patRec.dispose();
     super.dispose();
   }
 
@@ -59,16 +66,29 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   Widget build(BuildContext context) {
     return ChangeNotifierProvider.value(
       value: _audio,
-      child: Consumer2<WebRTCService, AudioService>(
-        builder: (context, webrtc, audio, _) {
+      child: MultiProvider(
+        providers: [ChangeNotifierProvider.value(value: _patRec)],
+        child: Consumer3<WebRTCService, AudioService, PatientRecordingService>(
+        builder: (context, webrtc, audio, patRec, _) {
           if (webrtc.localStream != null) {
             _localRenderer.srcObject = webrtc.localStream;
           }
           if (webrtc.remoteStream != null) {
             _remoteRenderer.srcObject = webrtc.remoteStream;
           }
+          // sync roomId ให้ service รู้ว่าจะเขียน Firestore room ไหน
+          _patRec.setRoomId(webrtc.roomId);
 
           final isConnected = webrtc.callState == CallState.connected;
+
+          // เริ่ม/หยุด PCM capture ตาม call state
+          if (isConnected && !_pcmCapturing) {
+            _pcmCapturing = true;
+            startPcmCapture(); // ส่ง raw PCM ผ่าน DataChannel — 0dB loss
+          } else if (!isConnected && _pcmCapturing) {
+            _pcmCapturing = false;
+            stopPcmCapture();
+          }
 
           return Scaffold(
             backgroundColor: Colors.black,
@@ -123,7 +143,9 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
                     micEnabled: _micEnabled,
                     cameraEnabled: _cameraEnabled,
                     isSimulating: audio.isSimulating,
+                    isRecording: patRec.isRecording,
                     showSimPanel: _showSimPanel,
+                    recPosition: _recPosition,
                     onStartCall: _startCall,
                     onToggleMic: () {
                       setState(() => _micEnabled = !_micEnabled);
@@ -134,12 +156,31 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
                       webrtc.toggleCamera(_cameraEnabled);
                     },
                     onToggleSteth: () async {
+                      // ส่ง signal ก่อน toggle เพื่อลด Firestore delay
+                      // (doctor จะได้รับ signal เร็วขึ้น ลด gap เสียงที่หาย)
+                      final willEnable = !audio.isSimulating;
+                      webrtc.signaling.setHeartMode(willEnable);
                       await audio.toggleSimulation();
                     },
                     onToggleSimPanel: () {
                       setState(() => _showSimPanel = !_showSimPanel);
                     },
+                    onToggleRecord: () async {
+                      if (patRec.isRecording) {
+                        final messenger = ScaffoldMessenger.of(context);
+                        final url = await _patRec.stopAndUpload();
+                        if (mounted && url != null) {
+                          messenger.showSnackBar(
+                            const SnackBar(content: Text('อัพโหลดเสร็จแล้ว หมอสามารถเล่นได้แล้ว')),
+                          );
+                        }
+                      } else {
+                        await _patRec.startRecording(_recPosition.label);
+                      }
+                    },
+                    onChangePosition: (pos) => setState(() => _recPosition = pos),
                     onHangUp: () async {
+                      if (patRec.isRecording) await _patRec.stopAndUpload();
                       await audio.toggleSimulation();
                       await webrtc.hangUp();
                       if (mounted) Navigator.pop(context);
@@ -165,6 +206,7 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
             ),
           );
         },
+        ),
       ),
     );
   }
@@ -327,12 +369,16 @@ class _PatientControlBar extends StatelessWidget {
   final bool micEnabled;
   final bool cameraEnabled;
   final bool isSimulating;
+  final bool isRecording;
   final bool showSimPanel;
+  final HeartPosition recPosition;
   final VoidCallback onStartCall;
   final VoidCallback onToggleMic;
   final VoidCallback onToggleCamera;
   final VoidCallback onToggleSteth;
   final VoidCallback onToggleSimPanel;
+  final VoidCallback onToggleRecord;
+  final ValueChanged<HeartPosition> onChangePosition;
   final VoidCallback onHangUp;
 
   const _PatientControlBar({
@@ -340,12 +386,16 @@ class _PatientControlBar extends StatelessWidget {
     required this.micEnabled,
     required this.cameraEnabled,
     required this.isSimulating,
+    required this.isRecording,
     required this.showSimPanel,
+    required this.recPosition,
     required this.onStartCall,
     required this.onToggleMic,
     required this.onToggleCamera,
     required this.onToggleSteth,
     required this.onToggleSimPanel,
+    required this.onToggleRecord,
+    required this.onChangePosition,
     required this.onHangUp,
   });
 
@@ -388,6 +438,16 @@ class _PatientControlBar extends StatelessWidget {
                     label: isSimulating ? 'หยุดเสียง' : 'เสียงหัวใจ',
                     onTap: onToggleSteth,
                     badge: isSimulating,
+                  ),
+
+                // ปุ่ม record (แสดงตอน connected)
+                if (callState == CallState.connected)
+                  _Btn(
+                    icon: isRecording ? Icons.stop_circle : Icons.fiber_manual_record,
+                    color: isRecording ? Colors.red : Colors.white24,
+                    label: isRecording ? 'หยุด REC' : 'REC',
+                    onTap: onToggleRecord,
+                    badge: isRecording,
                   ),
 
                 // ปุ่มวางสาย
