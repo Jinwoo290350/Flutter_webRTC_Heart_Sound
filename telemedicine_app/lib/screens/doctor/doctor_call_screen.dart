@@ -42,6 +42,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   // Patient recordings จาก Firestore
   final List<PatientRecording> _patientRecordings = [];
   StreamSubscription? _patRecSub;
+  StreamSubscription? _patPlayerCompleteSub;
   final AudioPlayer _patPlayer = AudioPlayer();
   String? _playingPatRecId;
 
@@ -135,7 +136,8 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
     }
     setState(() => _playingPatRecId = rec.id);
     await _patPlayer.play(UrlSource(rec.url));
-    _patPlayer.onPlayerComplete.listen((_) {
+    _patPlayerCompleteSub?.cancel();
+    _patPlayerCompleteSub = _patPlayer.onPlayerComplete.listen((_) {
       if (mounted) setState(() => _playingPatRecId = null);
     });
   }
@@ -143,6 +145,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   @override
   void dispose() {
     _patRecSub?.cancel();
+    _patPlayerCompleteSub?.cancel();
     _patPlayer.dispose();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
@@ -189,15 +192,69 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
     );
   }
 
-  void _toggleRecord() {
+  Future<void> _toggleRecord() async {
     final webrtc = context.read<WebRTCService>();
     if (_rec.isRecording) {
-      _rec.stopRecording(_recPosition.label);
+      final countBefore = _rec.recordings.length;
+      await _rec.stopRecording(_recPosition.label);
+      if (!mounted) return;
+      final added = _rec.recordings.length - countBefore;
+      if (added > 0) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('บันทึกสำเร็จ — กด 🎵 ที่ AppBar เพื่อฟัง/ดาวน์โหลด'),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      } else {
+        final msgCount = _rec.pcmMessageCount;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('บันทึกล้มเหลว — รับ $msgCount messages จาก DataChannel (ต้อง >0)'),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 6),
+          ),
+        );
+      }
     } else {
+      final hasStream = webrtc.remoteStream != null;
+      if (!hasStream) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('ยังไม่ได้รับ stream จากคนไข้ — รอให้เชื่อมต่อก่อน'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 3),
+          ),
+        );
+        return;
+      }
+
+      final dc = kIsWeb ? null : webrtc.pcmChannel;
+      final dcOpen = dc?.state == RTCDataChannelState.RTCDataChannelOpen;
+
+      if (!kIsWeb && !dcOpen) {
+        final msg = dc == null
+            ? 'รอรับ DataChannel จากคนไข้... ลองใหม่อีกครั้งหลังไฟเขียวขึ้น'
+            : 'DataChannel กำลังเชื่อมต่อ (${dc.state})... รอไฟเขียวแล้วลองใหม่';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg), backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 3)),
+        );
+        return;
+      }
+
       _rec.startRecording(
         _recPosition.label,
         stream: webrtc.remoteStream,
-        dataChannel: kIsWeb ? null : webrtc.pcmChannel,
+        dataChannel: kIsWeb ? null : (dcOpen ? dc : null),
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('⏺ กำลังบันทึก ${_recPosition.labelTh}'),
+          duration: const Duration(seconds: 2),
+        ),
       );
     }
   }
@@ -324,7 +381,8 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                     selectedPosition: _recPosition,
                     onPositionChanged: (pos) => setState(() => _recPosition = pos),
                     pcmChannelReady: !kIsWeb &&
-                        webrtc.pcmChannel?.state == RTCDataChannelState.RTCDataChannelOpen,
+                        webrtc.pcmChannelState == RTCDataChannelState.RTCDataChannelOpen,
+                    pcmChannelState: kIsWeb ? null : webrtc.pcmChannelState,
                   ),
 
                 // Mode toggle
@@ -690,6 +748,48 @@ class _SeekBar extends StatelessWidget {
   }
 }
 
+// ==================== DataChannel Status Badge ====================
+
+class _DataChannelBadge extends StatelessWidget {
+  final RTCDataChannelState? state;
+  const _DataChannelBadge({this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color;
+    final String label;
+    final IconData icon;
+
+    if (state == RTCDataChannelState.RTCDataChannelOpen) {
+      color = Colors.greenAccent;
+      label = 'พร้อมบันทึก';
+      icon = Icons.circle;
+    } else if (state == RTCDataChannelState.RTCDataChannelConnecting) {
+      color = Colors.orangeAccent;
+      label = 'DataChannel กำลังเชื่อมต่อ...';
+      icon = Icons.circle;
+    } else if (state == RTCDataChannelState.RTCDataChannelClosing ||
+               state == RTCDataChannelState.RTCDataChannelClosed) {
+      color = Colors.redAccent;
+      label = 'DataChannel ปิดแล้ว';
+      icon = Icons.circle;
+    } else {
+      color = Colors.white38;
+      label = 'รอรับ DataChannel จากคนไข้...';
+      icon = Icons.circle_outlined;
+    }
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(icon, size: 10, color: color),
+        const SizedBox(width: 6),
+        Text(label, style: TextStyle(color: color, fontSize: 11)),
+      ],
+    );
+  }
+}
+
 // ==================== Heart Mode Overlay ====================
 
 class _HeartModeOverlay extends StatefulWidget {
@@ -697,12 +797,14 @@ class _HeartModeOverlay extends StatefulWidget {
   final HeartPosition selectedPosition;
   final ValueChanged<HeartPosition> onPositionChanged;
   final bool pcmChannelReady;
+  final RTCDataChannelState? pcmChannelState;
 
   const _HeartModeOverlay({
     required this.isRecording,
     required this.selectedPosition,
     required this.onPositionChanged,
     this.pcmChannelReady = false,
+    this.pcmChannelState,
   });
 
   @override
@@ -778,24 +880,7 @@ class _HeartModeOverlayState extends State<_HeartModeOverlay>
                 if (!kIsWeb)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 8),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.circle,
-                          size: 10,
-                          color: widget.pcmChannelReady ? Colors.blueAccent : Colors.white38,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          widget.pcmChannelReady ? 'PCM DataChannel พร้อม' : 'PCM DataChannel ยังไม่เชื่อมต่อ',
-                          style: TextStyle(
-                            color: widget.pcmChannelReady ? Colors.blueAccent : Colors.white38,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ],
-                    ),
+                    child: _DataChannelBadge(state: widget.pcmChannelState),
                   ),
 
                 // ── Heart icon + timer ──

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -46,6 +47,8 @@ class RecordingService extends ChangeNotifier {
   // PCM DataChannel recording (native preferred path)
   List<double>? _pcmSamples;      // accumulated Float32 samples from DataChannel
   bool _usingPcmChannel = false;  // true = กำลัง record จาก DataChannel
+  int _pcmMessageCount = 0;       // debug: นับ onMessage events
+  int get pcmMessageCount => _pcmMessageCount;
 
   // ==================== Playback state ====================
 
@@ -69,20 +72,22 @@ class RecordingService extends ChangeNotifier {
 
   // ==================== Init ====================
 
+  final List<StreamSubscription> _playerSubs = [];
+
   RecordingService() {
-    _player.onPlayerStateChanged.listen((state) {
+    _playerSubs.add(_player.onPlayerStateChanged.listen((state) {
       _playerState = state;
       if (state == PlayerState.completed) _currentlyPlayingId = null;
       notifyListeners();
-    });
-    _player.onPositionChanged.listen((pos) {
+    }));
+    _playerSubs.add(_player.onPositionChanged.listen((pos) {
       _position = pos;
       notifyListeners();
-    });
-    _player.onDurationChanged.listen((dur) {
+    }));
+    _playerSubs.add(_player.onDurationChanged.listen((dur) {
       _duration = dur;
       notifyListeners();
-    });
+    }));
   }
 
   // ==================== Recording ====================
@@ -97,7 +102,9 @@ class RecordingService extends ChangeNotifier {
     notifyListeners();
 
     if (stream == null) {
-      debugPrint('RecordingService: no stream — demo mode [$position]');
+      _isRecording = false;
+      notifyListeners();
+      debugPrint('RecordingService: no stream — cannot record [$position]');
       return;
     }
 
@@ -111,17 +118,25 @@ class RecordingService extends ChangeNotifier {
         // Native: ถ้ามี PCM DataChannel → ใช้ path นี้ก่อน (lossless, ไม่ผ่าน Android audio stack)
         if (dataChannel != null) {
           _pcmSamples = [];
+          _pcmMessageCount = 0;
           _usingPcmChannel = true;
           dataChannel.onMessage = (msg) {
             if (_pcmSamples == null) return;
+            _pcmMessageCount++;
             final bytes = msg.binary;
+            debugPrint('RecordingService: onMessage #$_pcmMessageCount isBinary=${msg.isBinary} bytes=${bytes.length} offset=${bytes.offsetInBytes}');
             if (bytes.isNotEmpty) {
-              final floats = bytes.buffer.asFloat32List(
-                  bytes.offsetInBytes, bytes.lengthInBytes ~/ 4);
-              _pcmSamples!.addAll(floats);
+              // copy ออกมาก่อนเพื่อแก้ปัญหา offsetInBytes ≠ 0 บน Android
+              final raw = bytes.offsetInBytes == 0
+                  ? bytes
+                  : Uint8List.fromList(bytes);
+              if (raw.length >= 4) {
+                final floats = raw.buffer.asFloat32List(0, raw.lengthInBytes ~/ 4);
+                _pcmSamples!.addAll(floats);
+              }
             }
           };
-          debugPrint('RecordingService: PCM DataChannel recording started [$position]');
+          debugPrint('RecordingService: PCM DataChannel recording started [$position] state=${dataChannel.state}');
         } else {
           // Fallback: AudioRecord — ใช้เมื่อไม่มี DataChannel
           _usingPcmChannel = false;
@@ -208,7 +223,7 @@ class RecordingService extends ChangeNotifier {
             debugPrint('RecordingService: PCM WAV → $path (${await f.length()} bytes, ${samples.length} samples)');
           }
         } else {
-          debugPrint('RecordingService: PCM samples empty → fallback');
+          debugPrint('RecordingService: PCM samples empty — messages received: $_pcmMessageCount');
         }
       } catch (e, st) {
         debugPrint('RecordingService: PCM write error: $e\n$st');
@@ -235,12 +250,11 @@ class RecordingService extends ChangeNotifier {
       _nativePath = null;
     }
 
-    // Fallback: ถ้า recording ล้มเหลว → ใช้ best sample แทน
+    // ถ้า recording ล้มเหลวจริง → ไม่ add เข้า list (ไม่ใช้ fake asset)
     if (path.isEmpty) {
-      final assetName = position.toLowerCase();
-      path = 'assets/heart_sounds/${assetName}_best.wav';
-      isAsset = true;
-      debugPrint('RecordingService: fallback asset → $path');
+      debugPrint('RecordingService: recording failed — no data captured, not saving');
+      notifyListeners();
+      return;
     }
 
     final recording = HeartRecording(
@@ -375,6 +389,7 @@ class RecordingService extends ChangeNotifier {
 
   @override
   void dispose() {
+    for (final s in _playerSubs) { s.cancel(); }
     _activeRecorder?.dispose();
     _player.dispose();
     super.dispose();

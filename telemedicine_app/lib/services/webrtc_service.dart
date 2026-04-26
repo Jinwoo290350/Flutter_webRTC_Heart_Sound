@@ -2,6 +2,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audio_session/audio_session.dart';
+import 'package:record/record.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../config/webrtc_config.dart';
 import '../config/firebase_config.dart';
 import '../models/call_state.dart';
@@ -28,9 +30,14 @@ class WebRTCService extends ChangeNotifier {
   MediaStream? _remoteStream;
   RTCDataChannel? _pcmChannel;     // raw PCM heart sound DataChannel
 
+  // ==================== Native PCM Capture (Patient side) ====================
+  AudioRecorder? _pcmRecorder;
+  StreamSubscription<Uint8List>? _pcmStreamSub;
+
   MediaStream? get localStream => _localStream;
   MediaStream? get remoteStream => _remoteStream;
   RTCDataChannel? get pcmChannel => _pcmChannel;
+  RTCDataChannelState? get pcmChannelState => _pcmChannel?.state;
   bool get hasStethoscope => _stethStream != null;
 
   final SignalingService _signaling = SignalingService();
@@ -93,6 +100,10 @@ class WebRTCService extends ChangeNotifier {
     _peerConnection!.onDataChannel = (channel) {
       if (channel.label == 'pcm-heart') {
         _pcmChannel = channel;
+        channel.onDataChannelState = (state) {
+          debugPrint('WebRTCService: PCM DataChannel state=$state');
+          notifyListeners();
+        };
         debugPrint('WebRTCService: PCM DataChannel received (doctor side)');
         notifyListeners();
       }
@@ -101,13 +112,16 @@ class WebRTCService extends ChangeNotifier {
 
   /// สร้าง PCM DataChannel ฝั่ง patient (caller) — เรียกหลัง _createPeerConnection
   Future<void> _createPcmChannel() async {
-    if (kIsWeb) return; // Web: JS interceptor จัดการเอง
+    // หมายเหตุ: ต้องสร้าง DataChannel ทั้งบน web และ native
+    // บน web: flutter_webrtc ส่งผ่าน JS createDataChannel → PatchedPC2 interceptor ใน index.html
+    //         จะ set _pcmChannel JS variable → startPcmCapture ส่งข้อมูลได้
+    // บน native: สร้าง RTCDataChannel โดยตรง → callee รับผ่าน onDataChannel callback
     try {
       _pcmChannel = await _peerConnection!.createDataChannel(
         'pcm-heart',
         RTCDataChannelInit()
-          ..ordered = false     // ไม่ต้องการ ordered — latency สำคัญกว่า
-          ..maxRetransmits = 0, // ไม่ retry — เสียงเก่า drop ดีกว่า lag
+          ..ordered = true,     // TCP-like: ทุก packet ถึงแน่นอน ไม่มี gap ใน WAV
+          // ไม่ set maxRetransmits → reliable delivery (สำคัญกว่า latency สำหรับ medical recording)
       );
       _pcmChannel!.onDataChannelState = (state) {
         debugPrint('WebRTCService: PCM DataChannel state=$state');
@@ -329,9 +343,70 @@ class WebRTCService extends ChangeNotifier {
     _stethStream?.getAudioTracks().forEach((t) => t.enabled = enabled);
   }
 
+  // ==================== Native PCM Send (Patient → Doctor via DataChannel) ====================
+
+  /// เริ่มจับเสียง mic บน Android แล้วส่งเป็น Float32 PCM ผ่าน DataChannel
+  /// เรียกจาก PatientCallScreen เมื่อ connected และ !kIsWeb
+  Future<void> startNativePcmCapture() async {
+    if (_pcmChannel == null) {
+      debugPrint('WebRTCService: PCM DataChannel not ready — skip native capture');
+      return;
+    }
+    if (_pcmRecorder != null) return; // already running
+
+    final status = await Permission.microphone.request();
+    if (!status.isGranted) {
+      debugPrint('WebRTCService: mic permission denied for PCM capture');
+      return;
+    }
+
+    try {
+      _pcmRecorder = AudioRecorder();
+      final stream = await _pcmRecorder!.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,  // 16kHz — พอสำหรับ 20–500Hz heart sounds, bandwidth ต่ำ
+          numChannels: 1,
+          noiseSuppress: false,
+          echoCancel: false,
+          autoGain: false,
+        ),
+      );
+
+      _pcmStreamSub = stream.listen((chunk) {
+        if (_pcmChannel?.state != RTCDataChannelState.RTCDataChannelOpen) return;
+        // Int16 bytes → Float32 bytes สำหรับ RecordingService._writeWav ที่รับ Float32
+        final int16 = chunk.buffer.asInt16List(chunk.offsetInBytes, chunk.lengthInBytes ~/ 2);
+        final float32 = Float32List(int16.length);
+        for (int i = 0; i < int16.length; i++) {
+          float32[i] = int16[i] / 32768.0;
+        }
+        _pcmChannel!.send(RTCDataChannelMessage.fromBinary(float32.buffer.asUint8List()));
+      }, onError: (e) {
+        debugPrint('WebRTCService: PCM stream error: $e');
+      });
+
+      debugPrint('WebRTCService: native PCM capture started (16kHz mono)');
+    } catch (e) {
+      debugPrint('WebRTCService: native PCM capture failed: $e');
+      await _pcmRecorder?.dispose();
+      _pcmRecorder = null;
+    }
+  }
+
+  Future<void> stopNativePcmCapture() async {
+    await _pcmStreamSub?.cancel();
+    _pcmStreamSub = null;
+    await _pcmRecorder?.stop();
+    await _pcmRecorder?.dispose();
+    _pcmRecorder = null;
+    debugPrint('WebRTCService: native PCM capture stopped');
+  }
+
   Future<void> hangUp() async {
     _iceDisconnectTimer?.cancel();
     _iceDisconnectTimer = null;
+    await stopNativePcmCapture();
     _setState(CallState.ended);
     await _signaling.endRoom();
     await _localStream?.dispose();
@@ -368,6 +443,8 @@ class WebRTCService extends ChangeNotifier {
   @override
   void dispose() {
     _iceDisconnectTimer?.cancel();
+    _pcmStreamSub?.cancel();
+    _pcmRecorder?.dispose();
     _localStream?.dispose();
     _stethStream?.dispose();
     _remoteStream?.dispose();

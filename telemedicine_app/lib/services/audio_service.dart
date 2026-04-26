@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -144,8 +145,10 @@ class AudioService extends ChangeNotifier {
   String _simVariant = 'best'; // default = top score จาก analysis
   String get simVariant => _simVariant;
 
+  StreamSubscription? _simPlayerSub;
+
   AudioService() {
-    _simPlayer.onPlayerStateChanged.listen((_) => notifyListeners());
+    _simPlayerSub = _simPlayer.onPlayerStateChanged.listen((_) => notifyListeners());
     _simPlayer.setReleaseMode(ReleaseMode.loop); // เล่นวนซ้ำ
   }
 
@@ -192,6 +195,7 @@ class AudioService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _simPlayerSub?.cancel();
     _simPlayer.dispose();
     _stethStream?.dispose();
     super.dispose();

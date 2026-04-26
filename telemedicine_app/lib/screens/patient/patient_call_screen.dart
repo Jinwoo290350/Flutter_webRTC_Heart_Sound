@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -84,10 +85,18 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
           // เริ่ม/หยุด PCM capture ตาม call state
           if (isConnected && !_pcmCapturing) {
             _pcmCapturing = true;
-            startPcmCapture(); // ส่ง raw PCM ผ่าน DataChannel — 0dB loss
+            if (kIsWeb) {
+              startPcmCapture(); // Web: JS MediaRecorder
+            } else {
+              webrtc.startNativePcmCapture(); // Android: AudioRecord → DataChannel
+            }
           } else if (!isConnected && _pcmCapturing) {
             _pcmCapturing = false;
-            stopPcmCapture();
+            if (kIsWeb) {
+              stopPcmCapture();
+            } else {
+              webrtc.stopNativePcmCapture();
+            }
           }
 
           return Scaffold(

@@ -496,6 +496,14 @@
     var _OrigPC = window.RTCPeerConnection;
     function PatchedPC2(config) {
       var pc = new _OrigPC(config);
+      // Track PC ใน _pcs เพื่อให้ startJsRecording หา remote audio tracks ได้
+      window._pcs = window._pcs || [];
+      window._pcs.push(pc);
+      pc.addEventListener('connectionstatechange', function () {
+        if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+          window._pcs = window._pcs.filter(function (p) { return p !== pc; });
+        }
+      });
       // Patient side — intercept createDataChannel
       var _origCreate = pc.createDataChannel.bind(pc);
       pc.createDataChannel = function (label, opts) {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
 
@@ -70,20 +71,22 @@ class _HeartSoundSampleScreenState extends State<HeartSoundSampleScreen> {
   final AudioPlayer _player = AudioPlayer();
   String? _playingAsset;
   PlayerState _playerState = PlayerState.stopped;
+  final List<StreamSubscription> _playerSubs = [];
 
   @override
   void initState() {
     super.initState();
-    _player.onPlayerStateChanged.listen((state) {
+    _playerSubs.add(_player.onPlayerStateChanged.listen((state) {
       if (mounted) setState(() => _playerState = state);
-    });
-    _player.onPlayerComplete.listen((_) {
+    }));
+    _playerSubs.add(_player.onPlayerComplete.listen((_) {
       if (mounted) setState(() => _playingAsset = null);
-    });
+    }));
   }
 
   @override
   void dispose() {
+    for (final s in _playerSubs) { s.cancel(); }
     _player.dispose();
     super.dispose();
   }

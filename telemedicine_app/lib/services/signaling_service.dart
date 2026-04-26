@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -21,6 +22,9 @@ class SignalingService {
   /// Reference ไปยัง room document ปัจจุบัน
   DocumentReference? _roomRef;
   String? _roomId;
+
+  /// เก็บ Firestore stream subscriptions ทั้งหมดเพื่อ cancel ใน reset()
+  final List<StreamSubscription> _subs = [];
 
   String? get roomId => _roomId;
 
@@ -48,7 +52,7 @@ class SignalingService {
   /// Patient รอฟัง answer จาก doctor
   /// เมื่อ doctor อัปโหลด answer, callback จะถูกเรียก
   void listenForAnswer(Function(RTCSessionDescription) onAnswer) {
-    _roomRef!.snapshots().listen(
+    _subs.add(_roomRef!.snapshots().listen(
       (snapshot) {
         if (!snapshot.exists) return;
 
@@ -63,7 +67,7 @@ class SignalingService {
         }
       },
       onError: (e) => debugPrint('[Signaling] listenForAnswer error: $e'),
-    );
+    ));
   }
 
   // ==================== Doctor (Callee) ====================
@@ -117,7 +121,7 @@ class SignalingService {
     String role,
     Function(RTCIceCandidate) onCandidate,
   ) {
-    _roomRef!
+    _subs.add(_roomRef!
         .collection('${role}_${FirebaseConfig.candidatesCollection}')
         .snapshots()
         .listen(
@@ -135,7 +139,7 @@ class SignalingService {
         }
       },
       onError: (e) => debugPrint('[Signaling] listenForRemoteCandidates error: $e'),
-    );
+    ));
   }
 
   // ==================== Room Management ====================
@@ -150,7 +154,7 @@ class SignalingService {
 
   /// ฟัง status ของ room (ตรวจว่าอีกฝ่ายวางสายหรือเปล่า)
   void listenForRoomStatus(Function(String) onStatusChange) {
-    _roomRef?.snapshots().listen(
+    _subs.add(_roomRef!.snapshots().listen(
       (snapshot) {
         if (!snapshot.exists) return;
         final data = snapshot.data() as Map<String, dynamic>;
@@ -158,7 +162,7 @@ class SignalingService {
         if (status != null) onStatusChange(status);
       },
       onError: (e) => debugPrint('[Signaling] listenForRoomStatus error: $e'),
-    );
+    ));
   }
 
   /// Patient ส่งสัญญาณ heartMode ไปยัง doctor ผ่าน Firestore
@@ -174,7 +178,7 @@ class SignalingService {
 
   /// Doctor ฟัง heartMode signal จาก patient
   void listenForHeartMode(void Function(bool enabled) onChanged) {
-    _roomRef?.snapshots().listen(
+    _subs.add(_roomRef!.snapshots().listen(
       (snapshot) {
         if (!snapshot.exists) return;
         final data = snapshot.data() as Map<String, dynamic>;
@@ -182,10 +186,12 @@ class SignalingService {
         if (val is bool) onChanged(val);
       },
       onError: (e) => debugPrint('[Signaling] listenForHeartMode error: $e'),
-    );
+    ));
   }
 
   void reset() {
+    for (final s in _subs) { s.cancel(); }
+    _subs.clear();
     _roomRef = null;
     _roomId = null;
   }
