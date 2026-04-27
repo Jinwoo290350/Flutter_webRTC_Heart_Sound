@@ -411,7 +411,16 @@
 
       node.port.onmessage = function (e) {
         if (_pcmChannel && _pcmChannel.readyState === 'open') {
+          if (!window._pcmSendCount) window._pcmSendCount = 0;
+          window._pcmSendCount++;
+          if (window._pcmSendCount <= 5 || window._pcmSendCount % 500 === 0) {
+            console.log('[PCM] send() #' + window._pcmSendCount + ' state=' + _pcmChannel.readyState + ' bytes=' + e.data.byteLength);
+          }
           _pcmChannel.send(e.data); // ArrayBuffer Float32LE 960 samples
+        } else if (!_pcmChannel) {
+          console.warn('[PCM] send() skipped — _pcmChannel is null');
+        } else {
+          console.warn('[PCM] send() skipped — readyState=' + (_pcmChannel && _pcmChannel.readyState));
         }
       };
 
@@ -454,7 +463,12 @@
     _pcmPlayCtx.resume();
 
     dataChannel.binaryType = 'arraybuffer';
-    dataChannel.onmessage = function (e) {
+    var _pcmMsgCount = 0;
+    dataChannel.addEventListener('message', function (e) {
+      _pcmMsgCount++;
+      if (_pcmMsgCount <= 5 || _pcmMsgCount % 100 === 0) {
+        console.log('[PCM] onmessage #' + _pcmMsgCount + ' bytes=' + e.data.byteLength);
+      }
       _pcmQueue.push(new Float32Array(e.data));
 
       if (!_pcmStarted && _pcmQueue.length >= _JITTER) {
@@ -475,7 +489,7 @@
           _pcmNextTime = t + _CHUNK_DUR;
         }
       }
-    };
+    });
     dataChannel.onclose = function () {
       console.log('[PCM] DataChannel closed — playback ended');
       _pcmStarted = false; _pcmQueue = [];
@@ -510,19 +524,21 @@
         var dc = _origCreate(label, opts);
         if (label === 'pcm-heart') {
           _pcmChannel = dc;
-          dc.onopen  = function () { console.log('[PCM] DataChannel open (patient)'); };
-          dc.onerror = function (e) { console.error('[PCM] DataChannel error:', e); };
+          console.log('[PCM] _pcmChannel set label=' + dc.label + ' readyState=' + dc.readyState);
+          dc.onopen  = function () { console.log('[PCM] ✅ DataChannel OPEN (patient can send)'); };
+          dc.onerror = function (e) { console.error('[PCM] ❌ DataChannel ERROR:', e); };
+          dc.onclose = function () { console.warn('[PCM] ⚠️ DataChannel CLOSED (patient)'); };
         }
         return dc;
       };
-      // Doctor side — receive DataChannel
-      pc.ondatachannel = function (event) {
+      // Doctor side — addEventListener ไม่โดน Flutter Dart ทับ (property assignment โดนทับ)
+      pc.addEventListener('datachannel', function (event) {
         var dc = event.channel;
         if (dc.label === 'pcm-heart') {
-          console.log('[PCM] DataChannel received (doctor)');
+          console.log('[PCM] ✅ ondatachannel fired! label=' + dc.label + ' readyState=' + dc.readyState);
           window.startPcmPlayback(dc);
         }
-      };
+      });
       return pc;
     }
     PatchedPC2.prototype = _OrigPC.prototype;
