@@ -29,6 +29,7 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   bool _cameraEnabled = true;
   bool _showSimPanel = false;
   bool _pcmCapturing = false;
+  bool _opusMuted = false;
   HeartPosition _recPosition = HeartPosition.aortic;
 
   @override
@@ -173,6 +174,11 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
                     },
                     onToggleSimPanel: () {
                       setState(() => _showSimPanel = !_showSimPanel);
+                    },
+                    opusMuted: _opusMuted,
+                    onToggleOpus: () {
+                      setState(() => _opusMuted = !_opusMuted);
+                      webrtc.toggleStethoscope(!_opusMuted);
                     },
                     onToggleRecord: () async {
                       if (patRec.isRecording) {
@@ -384,6 +390,8 @@ class _PatientControlBar extends StatelessWidget {
   final VoidCallback onStartCall;
   final VoidCallback onToggleMic;
   final VoidCallback onToggleCamera;
+  final bool opusMuted;
+  final VoidCallback onToggleOpus;
   final VoidCallback onToggleSteth;
   final VoidCallback onToggleSimPanel;
   final VoidCallback onToggleRecord;
@@ -398,9 +406,11 @@ class _PatientControlBar extends StatelessWidget {
     required this.isRecording,
     required this.showSimPanel,
     required this.recPosition,
+    required this.opusMuted,
     required this.onStartCall,
     required this.onToggleMic,
     required this.onToggleCamera,
+    required this.onToggleOpus,
     required this.onToggleSteth,
     required this.onToggleSimPanel,
     required this.onToggleRecord,
@@ -447,6 +457,15 @@ class _PatientControlBar extends StatelessWidget {
                     label: isSimulating ? 'หยุดเสียง' : 'เสียงหัวใจ',
                     onTap: onToggleSteth,
                     badge: isSimulating,
+                  ),
+
+                // ปุ่ม PCM Only (ปิด Opus stethoscope track)
+                if (callState == CallState.connected)
+                  _Btn(
+                    icon: opusMuted ? Icons.volume_off : Icons.volume_up,
+                    color: opusMuted ? Colors.orange : Colors.white24,
+                    label: opusMuted ? 'PCM Only' : 'Opus+PCM',
+                    onTap: onToggleOpus,
                   ),
 
                 // ปุ่ม record (แสดงตอน connected)
