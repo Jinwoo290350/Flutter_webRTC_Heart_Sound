@@ -40,6 +40,12 @@ external JSPromise _jsStopPcmCapture();
 @JS('stopPcmPlayback')
 external void _jsStopPcmPlayback();
 
+@JS('setPcmPlaybackMuted')
+external void _jsSetPcmPlaybackMuted(JSBoolean muted);
+
+@JS('setRemoteAudioMuted')
+external void _jsSetRemoteAudioMuted(JSBoolean muted);
+
 Future<void> startSimAudio(String path) async {
   try { await _jsStartSim(path.toJS).toDart; } catch (_) {}
 }
@@ -93,4 +99,12 @@ Future<void> stopPcmCapture() async {
 
 void stopPcmPlayback() {
   try { _jsStopPcmPlayback(); } catch (_) {}
+}
+
+void setPcmPlaybackMuted(bool muted) {
+  try { _jsSetPcmPlaybackMuted(muted.toJS); } catch (_) {}
+}
+
+void setRemoteAudioMuted(bool muted) {
+  try { _jsSetRemoteAudioMuted(muted.toJS); } catch (_) {}
 }

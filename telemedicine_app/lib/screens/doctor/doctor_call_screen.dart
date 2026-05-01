@@ -33,6 +33,9 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 
   bool _micEnabled = true;
   bool _cameraEnabled = true;
+  bool _opusMuted = false;
+  bool _pcmMuted = false;
+  bool _allMuted = false;
   bool _showRecordings = false;
   bool _showPatientRecordings = false;
 
@@ -320,6 +323,51 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
               backgroundColor: isHeart ? const Color(0xFF4A0000) : Colors.black87,
               foregroundColor: Colors.white,
               actions: [
+                // ปุ่มปิดเสียง output ทั้งหมด (Opus + PCM)
+                if (isConnected)
+                  IconButton(
+                    icon: Icon(_allMuted ? Icons.headset_off : Icons.headset),
+                    color: _allMuted ? Colors.orange : Colors.white,
+                    tooltip: _allMuted ? 'เปิดเสียง' : 'ปิดเสียงทั้งหมด',
+                    onPressed: () {
+                      final mute = !_allMuted;
+                      setState(() {
+                        _allMuted = mute;
+                        _opusMuted = mute;
+                        _pcmMuted = mute;
+                      });
+                      if (kIsWeb) { setRemoteAudioMuted(mute); } else { webrtc.toggleRemoteAudio(!mute); }
+                      setPcmPlaybackMuted(mute);
+                    },
+                  ),
+                // ปุ่มปิด Opus audio
+                if (isConnected)
+                  IconButton(
+                    icon: Icon(_opusMuted ? Icons.volume_off : Icons.volume_up),
+                    color: _opusMuted ? Colors.orange : Colors.white,
+                    tooltip: _opusMuted ? 'Opus: OFF' : 'Opus: ON',
+                    onPressed: () {
+                      setState(() {
+                        _opusMuted = !_opusMuted;
+                        _allMuted = _opusMuted && _pcmMuted;
+                      });
+                      if (kIsWeb) { setRemoteAudioMuted(_opusMuted); } else { webrtc.toggleRemoteAudio(!_opusMuted); }
+                    },
+                  ),
+                // ปุ่มปิด PCM DataChannel audio
+                if (isConnected)
+                  IconButton(
+                    icon: Icon(_pcmMuted ? Icons.hearing_disabled : Icons.hearing),
+                    color: _pcmMuted ? Colors.orange : Colors.white,
+                    tooltip: _pcmMuted ? 'PCM: OFF' : 'PCM: ON',
+                    onPressed: () {
+                      setState(() {
+                        _pcmMuted = !_pcmMuted;
+                        _allMuted = _opusMuted && _pcmMuted;
+                      });
+                      setPcmPlaybackMuted(_pcmMuted);
+                    },
+                  ),
                 // Patient recordings badge
                 if (_patientRecordings.isNotEmpty)
                   IconButton(
@@ -1417,18 +1465,14 @@ class _DoctorControlBar extends StatelessWidget {
             label: 'ไมค์',
             onTap: onToggleMic,
           ),
-
-          // ปุ่ม Record (สำคัญใน heart mode)
           _Btn(
             icon: isRecording ? Icons.stop : Icons.fiber_manual_record,
-            color: isRecording ? Colors.red : (isHeart ? Colors.redAccent.withOpacity(0.7) : Colors.white24),
+            color: isRecording ? Colors.red : (isHeart ? Colors.redAccent.withValues(alpha: 0.7) : Colors.white24),
             label: isRecording ? 'หยุด REC' : 'บันทึก',
             onTap: onRecord,
             size: isHeart ? 60 : 52,
             badge: isRecording,
           ),
-
-          // วางสาย
           _Btn(
             icon: Icons.call_end,
             color: Colors.red,
@@ -1436,7 +1480,6 @@ class _DoctorControlBar extends StatelessWidget {
             label: 'วางสาย',
             onTap: onHangUp,
           ),
-
           _Btn(
             icon: cameraEnabled ? Icons.videocam : Icons.videocam_off,
             color: isHeart ? Colors.white12 : (cameraEnabled ? Colors.white24 : Colors.red),

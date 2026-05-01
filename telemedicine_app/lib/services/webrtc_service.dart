@@ -343,6 +343,10 @@ class WebRTCService extends ChangeNotifier {
     _stethStream?.getAudioTracks().forEach((t) => t.enabled = enabled);
   }
 
+  void toggleRemoteAudio(bool enabled) {
+    _remoteStream?.getAudioTracks().forEach((t) => t.enabled = enabled);
+  }
+
   // ==================== Native PCM Send (Patient → Doctor via DataChannel) ====================
 
   /// เริ่มจับเสียง mic บน Android แล้วส่งเป็น Float32 PCM ผ่าน DataChannel

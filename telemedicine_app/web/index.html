@@ -94,6 +94,7 @@
       var src  = ctx.createMediaElementSource(audio);
       var dest = ctx.createMediaStreamDestination();
       src.connect(dest);
+      _simStream = dest.stream;  // เก็บไว้เพื่อส่งเข้า PCM capture path
 
       await audio.play();
       _simAudio    = audio;
@@ -107,6 +108,7 @@
           if (sender.track && sender.track.kind === 'audio') {
             _simOrigTrack = sender.track;
             await sender.replaceTrack(_simNewTrack);
+            window.reroutePcmCapture(_simStream); // เชื่อม sim audio เข้า DataChannel path
             injected = true;
             console.log('[SimAudio] ✅ injected into WebRTC track');
             break;
@@ -147,6 +149,7 @@
           for (var sender of pc.getSenders()) {
             if (sender.track === _simNewTrack) {
               await sender.replaceTrack(_simOrigTrack);
+              window.reroutePcmCapture(null); // กลับมาใช้ mic stream ใน DataChannel path
               console.log('[SimAudio] ✅ restored original mic track');
             }
           }
@@ -374,6 +377,20 @@
   var _pcmCaptureCtx  = null;
   var _pcmCaptureNode = null;
   var _pcmChannel     = null; // RTCDataChannel — set by interceptor
+  var _pcmSrcNode     = null; // current Web Audio source node connected to worklet
+  var _pcmMicStream   = null; // getUserMedia stream (kept for rerouting back)
+  var _simStream      = null; // SimAudio dest.stream (kept for rerouting)
+
+  // สลับ audio source ที่ส่งเข้า PCM worklet โดยไม่ restart worklet
+  window.reroutePcmCapture = function (stream) {
+    if (!_pcmCaptureCtx || !_pcmCaptureNode) return;
+    if (_pcmSrcNode) { _pcmSrcNode.disconnect(); _pcmSrcNode = null; }
+    var target = stream || _pcmMicStream;
+    if (!target) return;
+    _pcmSrcNode = _pcmCaptureCtx.createMediaStreamSource(target);
+    _pcmSrcNode.connect(_pcmCaptureNode);
+    console.log('[PCM] rerouted to ' + (stream ? 'sim audio' : 'mic'));
+  };
 
   // ─── Patient side ────────────────────────────────────────────
   window.startPcmCapture = async function (deviceId) {
@@ -406,6 +423,7 @@
       await ctx.audioWorklet.addModule(blobUrl);
       URL.revokeObjectURL(blobUrl);
 
+      _pcmMicStream = stream;  // เก็บไว้เพื่อ reroute กลับจาก sim
       var src  = ctx.createMediaStreamSource(stream);
       var node = new AudioWorkletNode(ctx, 'steth-capture');
 
@@ -425,10 +443,15 @@
       };
 
       src.connect(node);
-      node.connect(ctx.destination); // Safari requires connection to destination
+      // Safari requires graph connection to destination — use muted gain to avoid feedback
+      var _muteGain = ctx.createGain();
+      _muteGain.gain.value = 0;
+      node.connect(_muteGain);
+      _muteGain.connect(ctx.destination);
 
       _pcmCaptureCtx  = ctx;
       _pcmCaptureNode = node;
+      _pcmSrcNode     = src;
       console.log('[PCM] ▶ capture started  deviceId=' + (deviceId || 'default'));
     } catch (e) {
       console.error('[PCM] capture error:', e);
@@ -469,7 +492,17 @@
       if (_pcmMsgCount <= 5 || _pcmMsgCount % 100 === 0) {
         console.log('[PCM] onmessage #' + _pcmMsgCount + ' bytes=' + e.data.byteLength);
       }
-      _pcmQueue.push(new Float32Array(e.data));
+      var f32 = new Float32Array(e.data);
+      if (_pcmMsgCount <= 5 || _pcmMsgCount % 100 === 0) {
+        var maxAmp = 0;
+        for (var i = 0; i < f32.length; i++) {
+          var a = Math.abs(f32[i]);
+          if (a > maxAmp) maxAmp = a;
+        }
+        console.log('[PCM] msg#' + _pcmMsgCount + ' maxAmp=' + maxAmp.toFixed(4) +
+                    (maxAmp === 0 ? ' ⚠️ ALL ZEROS' : ' ✅ has signal'));
+      }
+      _pcmQueue.push(f32);
 
       if (!_pcmStarted && _pcmQueue.length >= _JITTER) {
         _pcmStarted  = true;
@@ -502,6 +535,27 @@
     _pcmQueue   = [];
     _pcmStarted = false;
     console.log('[PCM] ■ playback stopped');
+  };
+
+  // ปิด/เปิด Opus remote audio tracks โดยตรงผ่าน PC receivers (ใช้งานได้บน web)
+  window.setRemoteAudioMuted = function (muted) {
+    var count = 0;
+    for (var pc of (window._pcs || [])) {
+      for (var receiver of pc.getReceivers()) {
+        if (receiver.track && receiver.track.kind === 'audio') {
+          receiver.track.enabled = !muted;
+          count++;
+        }
+      }
+    }
+    console.log('[Opus] remote audio ' + (muted ? 'muted' : 'unmuted') + ' (' + count + ' tracks)');
+  };
+
+  window.setPcmPlaybackMuted = function (muted) {
+    if (!_pcmPlayCtx) return;
+    if (muted) { _pcmPlayCtx.suspend().catch(function(){}); }
+    else        { _pcmPlayCtx.resume().catch(function(){}); }
+    console.log('[PCM] playback ' + (muted ? 'muted' : 'unmuted'));
   };
 
   // ─── DataChannel interceptor (ฝังใน PatchedPC) ──────────────

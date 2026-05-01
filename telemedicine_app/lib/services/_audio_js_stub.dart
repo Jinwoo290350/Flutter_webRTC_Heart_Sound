@@ -12,3 +12,5 @@ void stopJsRecording() {}
 Future<void> startPcmCapture({String? deviceId}) async {}
 Future<void> stopPcmCapture() async {}
 void stopPcmPlayback() {}
+void setPcmPlaybackMuted(bool muted) {}
+void setRemoteAudioMuted(bool muted) {}

@@ -30,6 +30,7 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   bool _showSimPanel = false;
   bool _pcmCapturing = false;
   bool _opusMuted = false;
+  bool _outputMuted = false;
   HeartPosition _recPosition = HeartPosition.aortic;
 
   @override
@@ -109,6 +110,16 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
               backgroundColor: Colors.black87,
               foregroundColor: Colors.white,
               actions: [
+                if (isConnected)
+                  IconButton(
+                    icon: Icon(_outputMuted ? Icons.headset_off : Icons.headset),
+                    color: _outputMuted ? Colors.orange : Colors.white,
+                    tooltip: _outputMuted ? 'เปิดเสียง' : 'ปิดเสียง output',
+                    onPressed: () {
+                      setState(() => _outputMuted = !_outputMuted);
+                      webrtc.toggleRemoteAudio(!_outputMuted);
+                    },
+                  ),
                 _CallStateChip(state: webrtc.callState),
                 const SizedBox(width: 8),
               ],
