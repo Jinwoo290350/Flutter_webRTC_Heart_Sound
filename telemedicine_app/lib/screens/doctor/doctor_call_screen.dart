@@ -51,6 +51,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 
   // Auto-record เมื่อ patient กด Heart Mode
   bool _heartModeSub = false;
+  bool _peerMuteSub = false;
 
   @override
   void initState() {
@@ -61,6 +62,17 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   Future<void> _initRenderers() async {
     await _localRenderer.initialize();
     await _remoteRenderer.initialize();
+  }
+
+  /// ฟัง mute request จาก patient — patient กด mute → doctor หยุดส่ง audio
+  void _listenPeerMute() {
+    if (_peerMuteSub) return;
+    _peerMuteSub = true;
+    final webrtc = context.read<WebRTCService>();
+    webrtc.signaling.listenForPeerMuteRequest('doctor', (muted) async {
+      if (!mounted) return;
+      await context.read<WebRTCService>().setLocalSenderEnabled(!muted);
+    });
   }
 
   /// ฟัง heartMode signal จาก patient — เรียกครั้งเดียวเมื่อ connected
@@ -314,7 +326,10 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
           if (isConnected && webrtc.roomId != null && _patRecSub == null) {
             _listenPatientRecordings(webrtc.roomId!);
           }
-          if (isConnected) _listenHeartMode();
+          if (isConnected) {
+            _listenHeartMode();
+            _listenPeerMute();
+          }
 
           return Scaffold(
             backgroundColor: isHeart ? const Color(0xFF1A0A0A) : Colors.black,
@@ -336,6 +351,9 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                         _opusMuted = mute;
                         _pcmMuted = mute;
                       });
+                      // sender-side mute — บอก patient หยุดส่ง audio ผ่าน DataChannel (fallback Firestore)
+                      webrtc.sendMuteCommand(mute);
+                      // local mute (fallback กัน lag ของ signaling)
                       if (kIsWeb) { setRemoteAudioMuted(mute); } else { webrtc.toggleRemoteAudio(!mute); }
                       setPcmPlaybackMuted(mute);
                     },

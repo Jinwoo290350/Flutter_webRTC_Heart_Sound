@@ -24,7 +24,14 @@ class SignalingService {
   String? _roomId;
 
   /// เก็บ Firestore stream subscriptions ทั้งหมดเพื่อ cancel ใน reset()
-  final List<StreamSubscription> _subs = [];
+  /// A5: Map keyed by listener name — ป้องกัน duplicate subscriptions
+  final Map<String, StreamSubscription> _subs = {};
+
+  void _addSub(String key, StreamSubscription sub) {
+    // cancel ของเก่าก่อน เพื่อกัน duplicate callback
+    _subs.remove(key)?.cancel();
+    _subs[key] = sub;
+  }
 
   String? get roomId => _roomId;
 
@@ -52,16 +59,21 @@ class SignalingService {
   /// Patient รอฟัง answer จาก doctor
   /// เมื่อ doctor อัปโหลด answer, callback จะถูกเรียก
   void listenForAnswer(Function(RTCSessionDescription) onAnswer) {
-    _subs.add(_roomRef!.snapshots().listen(
+    _addSub('answer', _roomRef!.snapshots().listen(
       (snapshot) {
         if (!snapshot.exists) return;
 
         final data = snapshot.data() as Map<String, dynamic>;
         if (data.containsKey(FirebaseConfig.answerField)) {
           final answerData = data[FirebaseConfig.answerField];
+          // N4: validate fields
+          if (answerData is! Map || answerData['sdp'] == null || answerData['type'] == null) {
+            debugPrint('[Signaling] invalid answer data: $answerData');
+            return;
+          }
           final answer = RTCSessionDescription(
-            answerData['sdp'],
-            answerData['type'],
+            answerData['sdp'] as String,
+            answerData['type'] as String,
           );
           onAnswer(answer);
         }
@@ -121,7 +133,7 @@ class SignalingService {
     String role,
     Function(RTCIceCandidate) onCandidate,
   ) {
-    _subs.add(_roomRef!
+    _addSub('candidates_$role', _roomRef!
         .collection('${role}_${FirebaseConfig.candidatesCollection}')
         .snapshots()
         .listen(
@@ -154,7 +166,7 @@ class SignalingService {
 
   /// ฟัง status ของ room (ตรวจว่าอีกฝ่ายวางสายหรือเปล่า)
   void listenForRoomStatus(Function(String) onStatusChange) {
-    _subs.add(_roomRef!.snapshots().listen(
+    _addSub('roomStatus', _roomRef!.snapshots().listen(
       (snapshot) {
         if (!snapshot.exists) return;
         final data = snapshot.data() as Map<String, dynamic>;
@@ -178,7 +190,7 @@ class SignalingService {
 
   /// Doctor ฟัง heartMode signal จาก patient
   void listenForHeartMode(void Function(bool enabled) onChanged) {
-    _subs.add(_roomRef!.snapshots().listen(
+    _addSub('heartMode', _roomRef!.snapshots().listen(
       (snapshot) {
         if (!snapshot.exists) return;
         final data = snapshot.data() as Map<String, dynamic>;
@@ -189,8 +201,40 @@ class SignalingService {
     ));
   }
 
+  /// ส่งคำขอ "ฉันไม่อยากได้ยินเสียง peer แล้ว" → peer หยุดส่ง audio
+  /// [myRole]: 'doctor' หรือ 'patient' — ฝั่งที่กดปุ่ม mute
+  ///
+  /// เขียนลง field:
+  ///   doctor กด mute → doctorIncomingMute=true → patient stop sending
+  ///   patient กด mute → patientIncomingMute=true → doctor stop sending
+  Future<void> setRemoteIncomingMute(String myRole, bool muted) async {
+    if (_roomRef == null) return;
+    final field = myRole == 'doctor' ? 'doctorIncomingMute' : 'patientIncomingMute';
+    try {
+      await _roomRef!.update({field: muted});
+      debugPrint('[Signaling] $field → $muted');
+    } catch (e) {
+      debugPrint('[Signaling] setRemoteIncomingMute error: $e');
+    }
+  }
+
+  /// ฟัง mute request จาก peer — ถ้า peer ขอ mute เราต้องหยุดส่ง audio
+  /// [myRole]: role ของตัวเอง — เราฟัง field ของ peer
+  void listenForPeerMuteRequest(String myRole, void Function(bool muted) onChanged) {
+    final field = myRole == 'doctor' ? 'patientIncomingMute' : 'doctorIncomingMute';
+    _addSub('peerMute', _roomRef!.snapshots().listen(
+      (snapshot) {
+        if (!snapshot.exists) return;
+        final data = snapshot.data() as Map<String, dynamic>;
+        final val = data[field];
+        if (val is bool) onChanged(val);
+      },
+      onError: (e) => debugPrint('[Signaling] listenForPeerMuteRequest error: $e'),
+    ));
+  }
+
   void reset() {
-    for (final s in _subs) { s.cancel(); }
+    for (final s in _subs.values) { s.cancel(); }
     _subs.clear();
     _roomRef = null;
     _roomId = null;

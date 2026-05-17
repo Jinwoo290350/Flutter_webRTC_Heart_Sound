@@ -14,3 +14,5 @@ Future<void> stopPcmCapture() async {}
 void stopPcmPlayback() {}
 void setPcmPlaybackMuted(bool muted) {}
 void setRemoteAudioMuted(bool muted) {}
+void setPcmSendEnabled(bool enabled) {}
+void setAudioSenderEnabled(bool enabled) {}

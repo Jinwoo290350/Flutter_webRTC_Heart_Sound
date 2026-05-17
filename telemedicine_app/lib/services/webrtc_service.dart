@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audio_session/audio_session.dart';
@@ -8,6 +9,8 @@ import '../config/webrtc_config.dart';
 import '../config/firebase_config.dart';
 import '../models/call_state.dart';
 import 'signaling_service.dart';
+import '_audio_js_stub.dart'
+    if (dart.library.js_interop) '_audio_js_web.dart' as audio_js;
 
 /// WebRTCService — จัดการ PeerConnection + dual-channel audio
 class WebRTCService extends ChangeNotifier {
@@ -29,6 +32,8 @@ class WebRTCService extends ChangeNotifier {
   MediaStream? _stethStream;       // stethoscope (filter OFF) — Phase 2
   MediaStream? _remoteStream;
   RTCDataChannel? _pcmChannel;     // raw PCM heart sound DataChannel
+  RTCDataChannel? _controlChannel; // peer-to-peer mute/control commands
+  String? _myRole;                 // 'patient' (caller) | 'doctor' (callee)
 
   // ==================== Native PCM Capture (Patient side) ====================
   AudioRecorder? _pcmRecorder;
@@ -43,6 +48,9 @@ class WebRTCService extends ChangeNotifier {
   final SignalingService _signaling = SignalingService();
   SignalingService get signaling => _signaling;
   Timer? _iceDisconnectTimer;
+  bool _isHangingUp = false;  // M2: ป้องกัน double hangUp
+  bool _iceRestartAttempted = false;  // M4: ICE restart limit (1 attempt per session)
+  bool _answerProcessed = false;  // ป้องกัน setRemoteDescription ซ้ำเพราะ Firestore fire หลายครั้ง
 
   // ==================== Setup ====================
 
@@ -60,12 +68,29 @@ class WebRTCService extends ChangeNotifier {
       debugPrint('ICE state: $state');
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
         _iceDisconnectTimer?.cancel();
+        _iceRestartAttempted = false;  // reset retry flag on successful connection
         _setState(CallState.connected);
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
-        // รอ 5 วินาที — WebRTC อาจ recover เองได้บนเน็ตไม่เสถียร
-        debugPrint('ICE disconnected — waiting 5s before hang up');
+        // M4: ลอง ICE restart ก่อน hang up
+        debugPrint('ICE disconnected — attempting ICE restart in 3s');
         _iceDisconnectTimer?.cancel();
-        _iceDisconnectTimer = Timer(const Duration(seconds: 5), hangUp);
+        _iceDisconnectTimer = Timer(const Duration(seconds: 3), () async {
+          if (_peerConnection == null || _callState == CallState.ended) return;
+          if (!_iceRestartAttempted) {
+            try {
+              _iceRestartAttempted = true;
+              debugPrint('WebRTCService: attempting ICE restart');
+              await _peerConnection!.restartIce();
+              // ให้เวลา 5 วิอีกรอบหลัง restart
+              _iceDisconnectTimer = Timer(const Duration(seconds: 5), hangUp);
+            } catch (e) {
+              debugPrint('WebRTCService: ICE restart failed: $e');
+              hangUp();
+            }
+          } else {
+            hangUp();
+          }
+        });
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         _iceDisconnectTimer?.cancel();
         hangUp();
@@ -74,7 +99,10 @@ class WebRTCService extends ChangeNotifier {
 
     _peerConnection!.onTrack = (event) {
       if (event.streams.isNotEmpty) {
-        _remoteStream = event.streams[0];
+        // N1: dedupe — ตรวจ stream id ก่อน replace
+        final newStream = event.streams[0];
+        if (_remoteStream?.id == newStream.id) return;
+        _remoteStream = newStream;
         notifyListeners();
       }
     };
@@ -106,8 +134,77 @@ class WebRTCService extends ChangeNotifier {
         };
         debugPrint('WebRTCService: PCM DataChannel received (doctor side)');
         notifyListeners();
+      } else if (channel.label == 'control') {
+        _controlChannel = channel;
+        channel.onMessage = _handleControlMessage;
+        channel.onDataChannelState = (state) {
+          debugPrint('WebRTCService: control DataChannel state=$state');
+        };
+        debugPrint('WebRTCService: control DataChannel received');
       }
     };
+  }
+
+  /// สร้าง control DataChannel ฝั่ง patient (caller) — ส่ง mute/command ตรงผ่าน P2P
+  /// ไม่พึ่ง Firestore → ทำงานได้แม้ internet flaky
+  Future<void> _createControlChannel() async {
+    try {
+      _controlChannel = await _peerConnection!.createDataChannel(
+        'control',
+        RTCDataChannelInit()..ordered = true,
+      );
+      _controlChannel!.onMessage = _handleControlMessage;
+      _controlChannel!.onDataChannelState = (state) {
+        debugPrint('WebRTCService: control DataChannel state=$state');
+      };
+      debugPrint('WebRTCService: control DataChannel created (patient side)');
+    } catch (e) {
+      debugPrint('WebRTCService: control DataChannel create error: $e');
+    }
+  }
+
+  /// รับคำสั่งจาก peer ผ่าน control channel
+  /// Bilateral mute: peer กด mute → เราต้อง (1) หยุดส่ง audio และ (2) mute playback ตัวเองด้วย
+  /// ผลคือกด mute ฝั่งใดฝั่งหนึ่ง → ทั้ง 2 ฝั่งเงียบทันที (no propagation delay)
+  void _handleControlMessage(RTCDataChannelMessage msg) {
+    try {
+      final data = jsonDecode(msg.text) as Map<String, dynamic>;
+      if (data['type'] == 'mute') {
+        final muted = data['muted'] as bool;
+        debugPrint('[Control] received mute=$muted → bilateral mute');
+        // 1. stop sending audio
+        setLocalSenderEnabled(!muted);
+        // 2. mute own playback (Opus + PCM)
+        if (kIsWeb) {
+          audio_js.setRemoteAudioMuted(muted);
+          audio_js.setPcmPlaybackMuted(muted);
+        } else {
+          toggleRemoteAudio(!muted);
+        }
+      }
+    } catch (e) {
+      debugPrint('[Control] handle msg error: $e');
+    }
+  }
+
+  /// ส่งคำสั่ง mute ไปยัง peer — DataChannel ก่อน, fallback Firestore
+  Future<void> sendMuteCommand(bool muted) async {
+    if (_controlChannel?.state == RTCDataChannelState.RTCDataChannelOpen) {
+      try {
+        _controlChannel!.send(RTCDataChannelMessage(jsonEncode({
+          'type': 'mute',
+          'muted': muted,
+        })));
+        debugPrint('[Control] sent mute=$muted via DataChannel');
+        return;
+      } catch (e) {
+        debugPrint('[Control] DC send failed: $e — falling back to Firestore');
+      }
+    }
+    // fallback — Firestore signaling (works once network recovers)
+    if (_myRole != null) {
+      await _signaling.setRemoteIncomingMute(_myRole!, muted);
+    }
   }
 
   /// สร้าง PCM DataChannel ฝั่ง patient (caller) — เรียกหลัง _createPeerConnection
@@ -220,6 +317,11 @@ class WebRTCService extends ChangeNotifier {
   // ==================== Patient (Caller) ====================
 
   Future<String?> startCall() async {
+    if (_callState != CallState.idle) {
+      debugPrint('WebRTCService: startCall ignored — state=$_callState');
+      return null;
+    }
+    _myRole = 'patient';
     _setState(CallState.calling);
 
     try {
@@ -232,7 +334,8 @@ class WebRTCService extends ChangeNotifier {
 
       debugPrint('>>> startCall: step 2 createPeerConnection');
       await _createPeerConnection();
-      await _createPcmChannel(); // patient สร้าง DataChannel ก่อน createOffer
+      await _createPcmChannel();     // patient สร้าง PCM DataChannel ก่อน createOffer
+      await _createControlChannel(); // patient สร้าง control DataChannel ด้วย
 
       debugPrint('>>> startCall: step 3 createOffer');
       final offer = await _peerConnection!.createOffer({
@@ -254,11 +357,27 @@ class WebRTCService extends ChangeNotifier {
       debugPrint('>>> startCall: roomId=$_roomId');
 
       _signaling.listenForAnswer((answer) async {
-        await _peerConnection!.setRemoteDescription(answer);
+        if (_peerConnection == null || _callState == CallState.ended) return;
+        // Firestore snapshot อาจ fire หลายครั้งสำหรับ document เดียวกัน
+        // → process answer ครั้งเดียวเท่านั้น
+        if (_answerProcessed) return;
+        _answerProcessed = true;
+        try {
+          await _peerConnection!.setRemoteDescription(answer);
+        } catch (e) {
+          debugPrint('WebRTCService: setRemoteDescription error: $e');
+          // อย่า hangUp — InvalidStateError เกิดจาก state mismatch แต่ call ยัง work ได้
+          // ถ้า error จริงจัง ICE จะ fail เองและ hangUp ผ่าน onIceConnectionState
+        }
       });
 
       _signaling.listenForRemoteCandidates('callee', (candidate) async {
-        await _peerConnection!.addCandidate(candidate);
+        if (_peerConnection == null || _callState == CallState.ended) return;
+        try {
+          await _peerConnection!.addCandidate(candidate);
+        } catch (e) {
+          debugPrint('WebRTCService: addCandidate (callee) error: $e');
+        }
       });
 
       _signaling.listenForRoomStatus((status) {
@@ -271,6 +390,15 @@ class WebRTCService extends ChangeNotifier {
       return _roomId;
     } catch (e) {
       _setError('ไม่สามารถเริ่ม call: $e');
+      // N3: cleanup partial state เมื่อ exception
+      await _localStream?.dispose();
+      await _stethStream?.dispose();
+      await _peerConnection?.close();
+      _localStream = null;
+      _stethStream = null;
+      _peerConnection = null;
+      _pcmChannel = null;
+      _signaling.reset();
       return null;
     }
   }
@@ -278,6 +406,11 @@ class WebRTCService extends ChangeNotifier {
   // ==================== Doctor (Callee) ====================
 
   Future<bool> joinCall(String roomId) async {
+    if (_callState != CallState.idle) {
+      debugPrint('WebRTCService: joinCall ignored — state=$_callState');
+      return false;
+    }
+    _myRole = 'doctor';
     _setState(CallState.waiting);
 
     try {
@@ -310,7 +443,12 @@ class WebRTCService extends ChangeNotifier {
       await _signaling.uploadAnswer(modifiedAnswer);
 
       _signaling.listenForRemoteCandidates('caller', (candidate) async {
-        await _peerConnection!.addCandidate(candidate);
+        if (_peerConnection == null || _callState == CallState.ended) return;
+        try {
+          await _peerConnection!.addCandidate(candidate);
+        } catch (e) {
+          debugPrint('WebRTCService: addCandidate (caller) error: $e');
+        }
       });
 
       _signaling.listenForRoomStatus((status) {
@@ -324,6 +462,12 @@ class WebRTCService extends ChangeNotifier {
       return true;
     } catch (e) {
       _setError('ไม่สามารถ join call: $e');
+      // N3: cleanup partial state
+      await _localStream?.dispose();
+      await _peerConnection?.close();
+      _localStream = null;
+      _peerConnection = null;
+      _signaling.reset();
       return false;
     }
   }
@@ -345,6 +489,36 @@ class WebRTCService extends ChangeNotifier {
 
   void toggleRemoteAudio(bool enabled) {
     _remoteStream?.getAudioTracks().forEach((t) => t.enabled = enabled);
+  }
+
+  /// Sender-side mute — เมื่อ peer ขอ mute มา เราหยุดส่ง audio ออก
+  ///  - disable audio track senders (Opus หยุดเข้ารหัส)
+  ///  - gate PCM DataChannel send (ทั้ง web worklet และ native pcmStreamSub)
+  bool _pcmSendEnabled = true;
+  bool get pcmSendEnabled => _pcmSendEnabled;
+
+  Future<void> setLocalSenderEnabled(bool enabled) async {
+    _pcmSendEnabled = enabled;
+    // 1. ปิด audio sender ทุกตัว — Opus track หยุดส่ง
+    if (_peerConnection != null) {
+      final senders = await _peerConnection!.getSenders();
+      for (final s in senders) {
+        if (s.track?.kind == 'audio') {
+          s.track!.enabled = enabled;
+        }
+      }
+    }
+    // 2. local audio track flag — กัน flutter_webrtc resync
+    _localStream?.getAudioTracks().forEach((t) => t.enabled = enabled);
+    _stethStream?.getAudioTracks().forEach((t) => t.enabled = enabled);
+    // 3. PCM send gate บน web (worklet onmessage จะเช็ค flag นี้)
+    //    + JS-side audio sender flag — บังคับ track.enabled แม้หลัง SimAudio replaceTrack
+    if (kIsWeb) {
+      audio_js.setPcmSendEnabled(enabled);
+      audio_js.setAudioSenderEnabled(enabled);
+    }
+    debugPrint('WebRTCService: local sender enabled=$enabled');
+    notifyListeners();
   }
 
   // ==================== Native PCM Send (Patient → Doctor via DataChannel) ====================
@@ -379,16 +553,23 @@ class WebRTCService extends ChangeNotifier {
 
       _pcmStreamSub = stream.listen((chunk) {
         if (_pcmChannel?.state != RTCDataChannelState.RTCDataChannelOpen) return;
+        if (!_pcmSendEnabled) return; // sender-side mute
         // Int16 bytes → Float32 bytes สำหรับ RecordingService._writeWav ที่รับ Float32
         final int16 = chunk.buffer.asInt16List(chunk.offsetInBytes, chunk.lengthInBytes ~/ 2);
         final float32 = Float32List(int16.length);
         for (int i = 0; i < int16.length; i++) {
           float32[i] = int16[i] / 32768.0;
         }
-        _pcmChannel!.send(RTCDataChannelMessage.fromBinary(float32.buffer.asUint8List()));
+        try {
+          _pcmChannel!.send(RTCDataChannelMessage.fromBinary(float32.buffer.asUint8List()));
+        } catch (e) {
+          debugPrint('WebRTCService: PCM send error: $e');
+        }
       }, onError: (e) {
         debugPrint('WebRTCService: PCM stream error: $e');
-      });
+        _pcmStreamSub?.cancel();
+        _pcmStreamSub = null;
+      }, cancelOnError: true);
 
       debugPrint('WebRTCService: native PCM capture started (16kHz mono)');
     } catch (e) {
@@ -408,22 +589,36 @@ class WebRTCService extends ChangeNotifier {
   }
 
   Future<void> hangUp() async {
-    _iceDisconnectTimer?.cancel();
-    _iceDisconnectTimer = null;
-    await stopNativePcmCapture();
-    _setState(CallState.ended);
-    await _signaling.endRoom();
-    await _localStream?.dispose();
-    await _stethStream?.dispose();
-    await _remoteStream?.dispose();
-    await _peerConnection?.close();
-    _localStream = null;
-    _stethStream = null;
-    _remoteStream = null;
-    _peerConnection = null;
-    _roomId = null;
-    _signaling.reset();
-    notifyListeners();
+    if (_isHangingUp) {
+      debugPrint('WebRTCService: hangUp already in progress — skip');
+      return;
+    }
+    _isHangingUp = true;
+    try {
+      _iceDisconnectTimer?.cancel();
+      _iceDisconnectTimer = null;
+      _answerProcessed = false;  // reset เพื่อ call ใหม่ทำงานได้
+      _iceRestartAttempted = false;
+      await stopNativePcmCapture();
+      _setState(CallState.ended);
+      await _signaling.endRoom();
+      await _localStream?.dispose();
+      await _stethStream?.dispose();
+      await _remoteStream?.dispose();
+      await _peerConnection?.close();
+      _localStream = null;
+      _stethStream = null;
+      _remoteStream = null;
+      _peerConnection = null;
+      _pcmChannel = null;
+      _controlChannel = null;
+      _myRole = null;
+      _roomId = null;
+      _signaling.reset();
+      notifyListeners();
+    } finally {
+      _isHangingUp = false;
+    }
   }
 
   void reset() {
@@ -453,6 +648,7 @@ class WebRTCService extends ChangeNotifier {
     _stethStream?.dispose();
     _remoteStream?.dispose();
     _peerConnection?.close();
+    _signaling.reset();  // A6: ป้องกัน Firestore listeners leak
     super.dispose();
   }
 }

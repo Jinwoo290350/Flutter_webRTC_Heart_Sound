@@ -46,6 +46,12 @@ external void _jsSetPcmPlaybackMuted(JSBoolean muted);
 @JS('setRemoteAudioMuted')
 external void _jsSetRemoteAudioMuted(JSBoolean muted);
 
+@JS('setPcmSendEnabled')
+external void _jsSetPcmSendEnabled(JSBoolean enabled);
+
+@JS('setAudioSenderEnabled')
+external void _jsSetAudioSenderEnabled(JSBoolean enabled);
+
 Future<void> startSimAudio(String path) async {
   try { await _jsStartSim(path.toJS).toDart; } catch (_) {}
 }
@@ -107,4 +113,12 @@ void setPcmPlaybackMuted(bool muted) {
 
 void setRemoteAudioMuted(bool muted) {
   try { _jsSetRemoteAudioMuted(muted.toJS); } catch (_) {}
+}
+
+void setPcmSendEnabled(bool enabled) {
+  try { _jsSetPcmSendEnabled(enabled.toJS); } catch (_) {}
+}
+
+void setAudioSenderEnabled(bool enabled) {
+  try { _jsSetAudioSenderEnabled(enabled.toJS); } catch (_) {}
 }

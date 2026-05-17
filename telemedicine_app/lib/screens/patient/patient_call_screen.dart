@@ -31,7 +31,19 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   bool _pcmCapturing = false;
   bool _opusMuted = false;
   bool _outputMuted = false;
+  bool _peerMuteSub = false;
   HeartPosition _recPosition = HeartPosition.aortic;
+
+  /// ฟัง mute request จาก doctor — doctor กด mute → patient หยุดส่ง audio
+  void _listenPeerMute() {
+    if (_peerMuteSub) return;
+    _peerMuteSub = true;
+    final webrtc = context.read<WebRTCService>();
+    webrtc.signaling.listenForPeerMuteRequest('patient', (muted) async {
+      if (!mounted) return;
+      await context.read<WebRTCService>().setLocalSenderEnabled(!muted);
+    });
+  }
 
   @override
   void initState() {
@@ -84,6 +96,8 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
 
           final isConnected = webrtc.callState == CallState.connected;
 
+          if (isConnected) _listenPeerMute();
+
           // เริ่ม/หยุด PCM capture ตาม call state
           if (isConnected && !_pcmCapturing) {
             _pcmCapturing = true;
@@ -117,7 +131,14 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
                     tooltip: _outputMuted ? 'เปิดเสียง' : 'ปิดเสียง output',
                     onPressed: () {
                       setState(() => _outputMuted = !_outputMuted);
-                      webrtc.toggleRemoteAudio(!_outputMuted);
+                      // sender-side mute — บอก doctor หยุดส่ง audio ผ่าน DataChannel (fallback Firestore)
+                      webrtc.sendMuteCommand(_outputMuted);
+                      // local fallback
+                      if (kIsWeb) {
+                        setRemoteAudioMuted(_outputMuted);
+                      } else {
+                        webrtc.toggleRemoteAudio(!_outputMuted);
+                      }
                     },
                   ),
                 _CallStateChip(state: webrtc.callState),

@@ -43,74 +43,102 @@
 
   <script>
   // ============================================================
-  // 1. RTCPeerConnection interceptor
-  //    เก็บ reference ทุก PC ที่ flutter_webrtc สร้าง
-  //    เพื่อให้ replaceTrack() ใช้งานได้ทีหลัง
+  // 1. RTCPeerConnection interceptor — moved to single patch below
+  //    (PatchedPC ตัวเดียวจัดการ: track _pcs, override close, intercept DataChannel)
+  //    ห้าม patch 2 ครั้งเพราะ wrapper-of-wrapper push PC เข้า _pcs ซ้ำ
   // ============================================================
-  (function () {
-    var _Orig = window.RTCPeerConnection;
-    window._pcs = [];
-
-    function PatchedPC(config) {
-      var pc = new _Orig(config);
-      window._pcs.push(pc);
-      var origClose = pc.close.bind(pc);
-      pc.close = function () {
-        window._pcs = window._pcs.filter(function (p) { return p !== pc; });
-        origClose();
-      };
-      return pc;
-    }
-    PatchedPC.prototype = _Orig.prototype;
-    Object.assign(PatchedPC, _Orig);
-    window.RTCPeerConnection = PatchedPC;
-  })();
+  window._pcs = [];
 
   // ============================================================
   // 2. Simulation audio injection
   //    เล่น WAV asset และ inject เข้า WebRTC audio track
   //    แทนที่จะเล่นออก speaker อย่างเดียว
   // ============================================================
-  var _simAudio    = null;
-  var _simCtx      = null;
+  var _simSrc       = null;  // AudioBufferSourceNode — แทน HTMLAudioElement
+  var _simCtx       = null;
   var _simOrigTrack = null;
   var _simNewTrack  = null;
+  var _simBufferCache = {};  // path → decoded AudioBuffer (re-use ไม่ต้อง decode ใหม่)
+
+  // helper: dedupe _pcs (double-patch อาจ push entry ซ้ำใน window._pcs)
+  function _uniquePcs() {
+    return Array.from(new Set(window._pcs || []));
+  }
+
+  // sender-side mute flag — บังคับ track.enabled ทุกตัว (รวม SimAudio replacement track)
+  // ป้องกัน bug: หลัง replaceTrack(_simNewTrack), track ใหม่ default enabled=true แม้ peer อยู่ใน mute state
+  var _audioSenderEnabled = true;
+  window.setAudioSenderEnabled = function (enabled) {
+    _audioSenderEnabled = !!enabled;
+    if (_simNewTrack) _simNewTrack.enabled = _audioSenderEnabled;
+    if (_simOrigTrack) _simOrigTrack.enabled = _audioSenderEnabled;
+    // aggressive: iterate ALL senders ทุก PC — กัน track ที่ Dart ไม่เห็น
+    var touched = 0;
+    for (var pc of (window._pcs || [])) {
+      try {
+        for (var s of pc.getSenders()) {
+          if (s.track && s.track.kind === 'audio') {
+            s.track.enabled = _audioSenderEnabled;
+            touched++;
+          }
+        }
+      } catch (e) {}
+    }
+    console.log('[AudioSender] enabled=' + _audioSenderEnabled +
+                ' simNew=' + (_simNewTrack ? _simNewTrack.enabled : 'n/a') +
+                ' simOrig=' + (_simOrigTrack ? _simOrigTrack.enabled : 'n/a') +
+                ' senders=' + touched);
+  };
 
   window.startSimAudio = async function (assetPath) {
     try {
       // หยุดอันเก่าก่อน
-      if (_simAudio) { _simAudio.pause(); _simAudio = null; }
-      if (_simCtx)   { await _simCtx.close(); _simCtx = null; }
+      if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc.disconnect(); _simSrc = null; }
+      if (_simCtx) { await _simCtx.close(); _simCtx = null; }
 
       var ctx = new (window.AudioContext || window.webkitAudioContext)();
       await ctx.resume();
 
-      // สร้าง URL จาก asset path (relative to page)
+      // BufferSource approach — ไม่มี implicit speaker output ได้แน่นอน
       var url = new URL(assetPath, window.location.href).href;
-      var audio = new Audio(url);
-      audio.loop = true;
-      audio.crossOrigin = 'anonymous';
+      var audioBuffer = _simBufferCache[url];
+      if (!audioBuffer) {
+        var response = await fetch(url);
+        var arrayBuffer = await response.arrayBuffer();
+        audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        _simBufferCache[url] = audioBuffer;
+      }
 
-      var src  = ctx.createMediaElementSource(audio);
+      var src  = ctx.createBufferSource();
+      src.buffer = audioBuffer;
+      src.loop = true;
       var dest = ctx.createMediaStreamDestination();
-      src.connect(dest);
-      _simStream = dest.stream;  // เก็บไว้เพื่อส่งเข้า PCM capture path
+      src.connect(dest);  // ONLY MediaStreamDestination — no speaker path
+      src.start();
+      _simStream = dest.stream;
 
-      await audio.play();
-      _simAudio    = audio;
+      _simSrc      = src;
       _simCtx      = ctx;
       _simNewTrack = dest.stream.getAudioTracks()[0];
+      _simNewTrack.enabled = _audioSenderEnabled;
+      // ถ้า peer สั่ง mute แล้ว → suspend sim ctx ทันที (กัน leak ไป speaker บน patient tab)
+      if (_opusMutedState || _pcmMutedState) {
+        ctx.suspend().catch(function(){});
+      }
 
-      // inject เข้าทุก RTCPeerConnection ที่เปิดอยู่
+      // inject เข้าทุก RTCPeerConnection ที่เปิดอยู่ (dedupe เพื่อไม่ iterate ซ้ำ)
       var injected = false;
-      for (var pc of (window._pcs || [])) {
+      for (var pc of _uniquePcs()) {
         for (var sender of pc.getSenders()) {
-          if (sender.track && sender.track.kind === 'audio') {
+          if (sender.track && sender.track.kind === 'audio' &&
+              sender.track !== _simNewTrack) {  // skip ถ้าเคย replace แล้ว
             _simOrigTrack = sender.track;
             await sender.replaceTrack(_simNewTrack);
-            window.reroutePcmCapture(_simStream); // เชื่อม sim audio เข้า DataChannel path
+            // defensive: บางครั้ง Chrome reset enabled state หลัง replaceTrack — re-apply
+            sender.track.enabled = _audioSenderEnabled;
+            window.reroutePcmCapture(_simStream);
             injected = true;
-            console.log('[SimAudio] ✅ injected into WebRTC track');
+            console.log('[SimAudio] ✅ injected (sender.track.enabled=' + sender.track.enabled + ')');
             break;
           }
         }
@@ -126,13 +154,15 @@
   // เรียกใหม่เมื่อ PC เชื่อมต่อสำเร็จ (กรณี sim เริ่มก่อน call)
   window._retrySimInject = async function () {
     if (!_simNewTrack) return;
-    for (var pc of (window._pcs || [])) {
+    _simNewTrack.enabled = _audioSenderEnabled;
+    for (var pc of _uniquePcs()) {
       for (var sender of pc.getSenders()) {
         if (sender.track && sender.track.kind === 'audio' &&
             sender.track !== _simNewTrack) {
           _simOrigTrack = sender.track;
           await sender.replaceTrack(_simNewTrack);
-          console.log('[SimAudio] ✅ retried inject');
+          sender.track.enabled = _audioSenderEnabled; // defensive re-apply
+          console.log('[SimAudio] ✅ retried inject (enabled=' + sender.track.enabled + ')');
         }
       }
     }
@@ -140,12 +170,14 @@
 
   window.stopSimAudio = async function () {
     try {
-      if (_simAudio) { _simAudio.pause(); _simAudio.src = ''; _simAudio = null; }
-      if (_simCtx)   { await _simCtx.close(); _simCtx = null; }
+      if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc.disconnect(); _simSrc = null; }
+      if (_simCtx) { await _simCtx.close(); _simCtx = null; }
 
       // คืน track เดิม
       if (_simOrigTrack && _simNewTrack) {
-        for (var pc of (window._pcs || [])) {
+        // respect current sender mute state กับ track ที่จะ restore กลับมา
+        _simOrigTrack.enabled = _audioSenderEnabled;
+        for (var pc of _uniquePcs()) {
           for (var sender of pc.getSenders()) {
             if (sender.track === _simNewTrack) {
               await sender.replaceTrack(_simOrigTrack);
@@ -169,7 +201,12 @@
   // ============================================================
   var _heartMode    = false;
   var _bassBoostDb  = 8; // default boost level (dB) — ลดจาก 15 เพราะ Android clipping
-  var _bassFilters  = new Map(); // videoElement → {ctx, shelf, peak80, peak200}
+  var _bassFilters  = new Map(); // videoElement → {ctx, shelf, peak80, peak200, masterGain}
+
+  // Mute states (sync ตอนสร้าง context ใหม่)
+  var _opusMutedState = false;
+  var _pcmMutedState  = false;
+  var _pcmMasterGain  = null;
 
   window.setHeartMode = function (enabled) {
     _heartMode = enabled;
@@ -188,17 +225,18 @@
   };
 
   function _applyBassBoostAll() {
-    document.querySelectorAll('video').forEach(function (v) {
-      if (v.srcObject && v.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(v)) {
-        _applyBassBoost(v);
+    _getRemoteMediaElements().forEach(function (el) {
+      if (el.srcObject && el.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(el)) {
+        _applyBassBoost(el);
       }
     });
   }
 
   function _applyBassBoost(videoEl) {
+    // detach always-on sink ก่อน เพื่อไม่ route ซ้อน
+    if (_audioSink.has(videoEl)) _detachAudioSink(videoEl);
     try {
       var ctx = new (window.AudioContext || window.webkitAudioContext)();
-      ctx.resume();
       var src   = ctx.createMediaStreamSource(videoEl.srcObject);
       var shelf = ctx.createBiquadFilter();
       shelf.type = 'lowshelf'; shelf.frequency.value = 500; shelf.gain.value = _bassBoostDb;
@@ -208,31 +246,140 @@
       peak200.type = 'peaking'; peak200.frequency.value = 200; peak200.Q.value = 0.7; peak200.gain.value = _bassBoostDb * 0.5;
       // Limiter — ป้องกัน clipping บน Android speaker ที่รับ bass boost ไม่ไหว
       var limiter = ctx.createDynamicsCompressor();
-      limiter.threshold.value = -3;   // เริ่ม compress ที่ -3 dBFS
-      limiter.knee.value      = 0;    // hard knee = limiter behavior
-      limiter.ratio.value     = 20;   // 20:1 = กด signal ที่เกิน threshold แทบไม่ผ่าน
+      limiter.threshold.value = -3;
+      limiter.knee.value      = 0;
+      limiter.ratio.value     = 20;
       limiter.attack.value    = 0.001;
       limiter.release.value   = 0.1;
-      src.connect(shelf); shelf.connect(peak80); peak80.connect(peak200); peak200.connect(limiter); limiter.connect(ctx.destination);
+      // master gain ก่อน destination เพื่อ instant mute
+      var masterGain = ctx.createGain();
+      masterGain.gain.value = _opusMutedState ? 0 : 1;
+      src.connect(shelf); shelf.connect(peak80); peak80.connect(peak200);
+      peak200.connect(limiter); limiter.connect(masterGain);
+      // Conditional connect + suspend ถ้า muted
+      if (_opusMutedState) {
+        ctx.suspend().catch(function(){});
+      } else {
+        masterGain.connect(ctx.destination);
+        ctx.resume().catch(function(){});
+      }
       videoEl.muted = true;
-      _bassFilters.set(videoEl, { ctx: ctx, shelf: shelf, peak80: peak80, peak200: peak200 });
-      console.log('[BassBoost] ✅ applied ' + _bassBoostDb + 'dB');
+      _bassFilters.set(videoEl, { ctx: ctx, shelf: shelf, peak80: peak80, peak200: peak200, masterGain: masterGain });
+      console.log('[BassBoost] ✅ applied ' + _bassBoostDb + 'dB (muted=' + _opusMutedState + ', connected=' + !_opusMutedState + ')');
     } catch (e) { console.error('[BassBoost] error:', e); }
   }
 
   function _removeBassBoostAll() {
     _bassFilters.forEach(function (f, videoEl) {
       f.ctx.close().catch(function(){});
-      videoEl.muted = false; videoEl.play().catch(function(){});
+      // ไม่ unmute ที่นี่ — ปล่อยให้ _attachAudioSink() ตั้ง videoEl.muted=true ต่อ
     });
     _bassFilters.clear();
+    // attach always-on sink ทันที (ไม่ต้องรอ interval)
+    _getRemoteMediaElements().forEach(_attachAudioSink);
   }
 
+  // ============================================================
+  // 3.5 Always-On Audio Sink — route ทุก remote audio ผ่าน Web Audio
+  //     เพื่อให้ mute เป็น deterministic ไม่ขึ้นกับ element.muted ที่อาจถูก reset
+  //
+  // CRITICAL: flutter_webrtc สร้าง <audio> ใน #html_webrtc_audio_manager_list
+  //          (display:none div) ไม่ใช่ <video>! ต้อง target ทั้ง audio และ video
+  // ============================================================
+  var _audioSink = new Map();  // mediaElement → { ctx, masterGain }
+  var _savedSrcObjects = new Map();  // mediaElement → stream (saved ตอน mute, restore ตอน unmute)
+
+  function _getRemoteMediaElements() {
+    // หา audio + video element ทุกที่ใน DOM (flutter_webrtc อาจสร้างใน hidden div)
+    var arr = [];
+    document.querySelectorAll('audio').forEach(function(e) { arr.push(e); });
+    document.querySelectorAll('video').forEach(function(e) { arr.push(e); });
+    return arr;
+  }
+
+  // Debug: log สิ่งที่อยู่ใน DOM ตอน mute
+  window._debugAudioElements = function () {
+    var audios = Array.from(document.querySelectorAll('audio'));
+    var videos = Array.from(document.querySelectorAll('video'));
+    console.log('[DEBUG] audios=' + audios.length + ' ids=' + audios.map(function(a){return a.id||'(no-id)';}).join(','));
+    console.log('[DEBUG] videos=' + videos.length + ' ids=' + videos.map(function(v){return v.id||'(no-id)';}).join(','));
+    audios.concat(videos).forEach(function (el) {
+      var atracks = el.srcObject ? el.srcObject.getAudioTracks().length : 0;
+      var sink = _audioSink.has(el) ? 'YES' : 'no';
+      var bass = _bassFilters.has(el) ? 'YES' : 'no';
+      console.log('[DEBUG] ' + el.tagName + '#' + (el.id||'(no-id)') +
+                  ' srcObject=' + !!el.srcObject + ' atracks=' + atracks +
+                  ' muted=' + el.muted + ' volume=' + el.volume + ' paused=' + el.paused +
+                  ' sink=' + sink + ' bass=' + bass);
+    });
+  };
+
+  function _attachAudioSink(el) {
+    if (_audioSink.has(el)) return;
+    if (_bassFilters.has(el)) return;  // bass boost จัดการ routing เองแล้ว
+    if (!el.srcObject || el.srcObject.getAudioTracks().length === 0) return;
+    try {
+      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      var src = ctx.createMediaStreamSource(el.srcObject);
+      var masterGain = ctx.createGain();
+      masterGain.gain.value = _opusMutedState ? 0 : 1;
+      src.connect(masterGain);
+      // Conditional connect: ถ้า muted, ไม่ connect ไป destination เลย → Chrome ไม่นับว่า tab playing audio
+      if (_opusMutedState) {
+        ctx.suspend().catch(function(){});  // suspend context ทั้งหมด
+      } else {
+        masterGain.connect(ctx.destination);
+        ctx.resume().catch(function(){});
+      }
+      el.muted = true;  // ป้องกัน direct output — เสียงผ่าน context เท่านั้น
+      _audioSink.set(el, { ctx: ctx, masterGain: masterGain });
+      console.log('[AudioSink] ✅ attached to ' + el.tagName + ' (muted=' + _opusMutedState + ', connected=' + !_opusMutedState + ')');
+    } catch (e) {
+      console.error('[AudioSink] error:', e);
+    }
+  }
+
+  function _detachAudioSink(el) {
+    var sink = _audioSink.get(el);
+    if (!sink) return;
+    sink.ctx.close().catch(function(){});
+    _audioSink.delete(el);
+  }
+
+  // Auto-attach interval — เก็บ media element ใหม่และ cleanup ที่หายไป
+  // + enforcement: ถ้า element มี sink/bass แล้ว → คง el.muted=true เสมอ
+  //   (flutter_webrtc อาจ reset muted=false เมื่อ stream เปลี่ยน)
   setInterval(function () {
-    if (!_heartMode) return;
-    document.querySelectorAll('video').forEach(function (v) {
-      if (v.srcObject && v.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(v)) {
-        _applyBassBoost(v);
+    var elements = _getRemoteMediaElements();
+    if (_heartMode) {
+      elements.forEach(function (el) {
+        if (el.srcObject && el.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(el)) {
+          _applyBassBoost(el);
+        }
+      });
+    } else {
+      // Normal mode — attach always-on sink
+      elements.forEach(function (el) {
+        if (el.srcObject && el.srcObject.getAudioTracks().length > 0) {
+          _attachAudioSink(el);
+        } else if (_audioSink.has(el)) {
+          _detachAudioSink(el);
+        }
+      });
+    }
+    // enforcement loop — กัน flutter_webrtc reset el.muted / restore srcObject
+    elements.forEach(function (el) {
+      if (_audioSink.has(el) || _bassFilters.has(el)) {
+        if (el.muted !== true) el.muted = true;
+        if (_opusMutedState && el.volume !== 0) el.volume = 0;
+      } else if (_opusMutedState) {
+        if (el.muted !== true) el.muted = true;
+        if (el.volume !== 0) el.volume = 0;
+      }
+      // re-assert srcObject=null ตอน muted (กัน flutter_webrtc re-attach stream)
+      if (_opusMutedState && el.srcObject) {
+        if (!_savedSrcObjects.has(el)) _savedSrcObjects.set(el, el.srcObject);
+        try { el.srcObject = null; } catch (e) {}
       }
     });
   }, 800);
@@ -247,7 +394,11 @@
     var url = new URL('assets/' + assetPath, window.location.href).href;
     _refAudio = new Audio(url);
     _refAudio.loop = true;
+    // respect current mute state
+    _refAudio.muted  = _opusMutedState;
+    _refAudio.volume = _opusMutedState ? 0 : 1;
     _refAudio.play().catch(function (e) { console.error('[Ref]', e); });
+    console.log('[Ref] play (muted=' + _refAudio.muted + ')');
   };
 
   window.stopReference = function () {
@@ -263,7 +414,7 @@
   window.startJsRecording = function () {
     return new Promise(function (resolve, reject) {
       // ดึง remote audio tracks จาก RTCPeerConnection โดยตรง (ไม่พึ่ง DOM video element)
-      var pcs = window._pcs || [];
+      var pcs = _uniquePcs();
       console.log('[JsRec] _pcs count:', pcs.length);
 
       var audioStream = new MediaStream();
@@ -380,6 +531,13 @@
   var _pcmSrcNode     = null; // current Web Audio source node connected to worklet
   var _pcmMicStream   = null; // getUserMedia stream (kept for rerouting back)
   var _simStream      = null; // SimAudio dest.stream (kept for rerouting)
+  var _pcmSendEnabled = true; // sender-side mute gate — set โดย setPcmSendEnabled()
+
+  // Sender-side mute: ถ้า peer ขอ mute มา หยุดส่ง PCM DataChannel chunks
+  window.setPcmSendEnabled = function (enabled) {
+    _pcmSendEnabled = !!enabled;
+    console.log('[PCM] send gate → ' + (_pcmSendEnabled ? 'OPEN' : 'CLOSED'));
+  };
 
   // สลับ audio source ที่ส่งเข้า PCM worklet โดยไม่ restart worklet
   window.reroutePcmCapture = function (stream) {
@@ -428,6 +586,7 @@
       var node = new AudioWorkletNode(ctx, 'steth-capture');
 
       node.port.onmessage = function (e) {
+        if (!_pcmSendEnabled) return; // sender-side mute gate
         if (_pcmChannel && _pcmChannel.readyState === 'open') {
           if (!window._pcmSendCount) window._pcmSendCount = 0;
           window._pcmSendCount++;
@@ -452,7 +611,12 @@
       _pcmCaptureCtx  = ctx;
       _pcmCaptureNode = node;
       _pcmSrcNode     = src;
-      console.log('[PCM] ▶ capture started  deviceId=' + (deviceId || 'default'));
+      // ถ้า peer สั่ง mute มาก่อนที่ capture จะเริ่ม → suspend ctx ทันที (กัน "tab playing audio" + leak)
+      if (_opusMutedState || _pcmMutedState) {
+        ctx.suspend().catch(function(){});
+      }
+      console.log('[PCM] ▶ capture started  deviceId=' + (deviceId || 'default') +
+                  ' ctxState=' + ctx.state);
     } catch (e) {
       console.error('[PCM] capture error:', e);
       throw e;
@@ -471,7 +635,7 @@
   var _pcmStarted   = false;
   var _pcmQueue     = [];
   var _CHUNK_DUR    = 960 / 48000;  // 0.02 s
-  var _JITTER       = 3;            // buffer 3 chunks (60 ms) before first play
+  var _JITTER       = 8;            // buffer 8 chunks (160 ms) — absorb network jitter, ลดเสียงแตก
 
   window.startPcmPlayback = function (dataChannel) {
     _pcmChannel = dataChannel;
@@ -482,6 +646,10 @@
       _pcmPlayCtx = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: 48000, latencyHint: 'interactive',
       });
+      // master gain ก่อน destination — ใช้ gain=0 แทน suspend สำหรับ instant mute
+      _pcmMasterGain = _pcmPlayCtx.createGain();
+      _pcmMasterGain.gain.value = _pcmMutedState ? 0 : 1;
+      _pcmMasterGain.connect(_pcmPlayCtx.destination);
     }
     _pcmPlayCtx.resume();
 
@@ -516,7 +684,7 @@
           buf.getChannelData(0).set(samples);
           var src = _pcmPlayCtx.createBufferSource();
           src.buffer = buf;
-          src.connect(_pcmPlayCtx.destination);
+          src.connect(_pcmMasterGain || _pcmPlayCtx.destination);
           var t = Math.max(_pcmNextTime, _pcmPlayCtx.currentTime);
           src.start(t);
           _pcmNextTime = t + _CHUNK_DUR;
@@ -537,10 +705,12 @@
     console.log('[PCM] ■ playback stopped');
   };
 
-  // ปิด/เปิด Opus remote audio tracks โดยตรงผ่าน PC receivers (ใช้งานได้บน web)
+  // ปิด/เปิด Opus output ครบทุก path บน web (deterministic ผ่าน Web Audio masterGain)
   window.setRemoteAudioMuted = function (muted) {
+    _opusMutedState = muted;
     var count = 0;
-    for (var pc of (window._pcs || [])) {
+    // 1. WebRTC receiver tracks (defense in depth)
+    for (var pc of _uniquePcs()) {
       for (var receiver of pc.getReceivers()) {
         if (receiver.track && receiver.track.kind === 'audio') {
           receiver.track.enabled = !muted;
@@ -548,25 +718,147 @@
         }
       }
     }
-    console.log('[Opus] remote audio ' + (muted ? 'muted' : 'unmuted') + ' (' + count + ' tracks)');
+    // 2. <audio>/<video> direct mute — บังคับ ALL elements (กัน flutter_webrtc reset)
+    //    ไม่ว่าจะมี sink หรือ bass filter หรือไม่ ก็ set el.muted ตาม mute state เสมอ
+    //    ถ้ามี sink/bass: ก็ยังต้อง muted=true (route ผ่าน WebAudio) — set ไม่ผิด
+    //    ถ้าไม่มี sink/bass: ต้องการ muted=true ตอนปิดเสียง
+    //    เมื่อ unmute: ถ้ามี sink/bass ต้องคง muted=true (เพราะ output ผ่าน WebAudio)
+    //                 ถ้าไม่มี ต้อง muted=false ให้ element เล่นออก speaker
+    var elements = _getRemoteMediaElements();
+    elements.forEach(function (el) {
+      if (!el.srcObject) return;
+      if (_audioSink.has(el) || _bassFilters.has(el)) {
+        el.muted = true;       // route ผ่าน WebAudio เท่านั้น — เก็บ muted=true เสมอ
+        el.volume = muted ? 0 : 1;
+      } else {
+        el.muted  = muted;
+        el.volume = muted ? 0 : 1;
+      }
+    });
+    // 3. Always-on audio sink — disconnect + SUSPEND ctx เลย กัน Chrome แสดง "tab playing"
+    _audioSink.forEach(function (s) {
+      if (!s.masterGain || !s.ctx) return;
+      s.masterGain.gain.value = muted ? 0 : 1;
+      try {
+        if (muted) {
+          s.masterGain.disconnect();
+          s.ctx.suspend().catch(function(){});
+        } else {
+          s.masterGain.connect(s.ctx.destination);
+          s.ctx.resume().catch(function(){});
+        }
+      } catch (e) { /* already (dis)connected */ }
+    });
+    // 4. Bass boost — disconnect + SUSPEND ctx
+    _bassFilters.forEach(function (f) {
+      if (!f.masterGain || !f.ctx) return;
+      f.masterGain.gain.value = muted ? 0 : 1;
+      try {
+        if (muted) {
+          f.masterGain.disconnect();
+          f.ctx.suspend().catch(function(){});
+        } else {
+          f.masterGain.connect(f.ctx.destination);
+          f.ctx.resume().catch(function(){});
+        }
+      } catch (e) { /* already (dis)connected */ }
+    });
+    // 5. Reference compare audio (doctor's heart sound reference player)
+    //    _refAudio เป็น HTMLAudioElement ที่เล่นออก speaker โดยตรง — ต้อง mute ด้วย
+    if (_refAudio) {
+      _refAudio.muted = muted;
+      _refAudio.volume = muted ? 0 : 1;
+    }
+    // 6. NUCLEAR: el.srcObject = null กัน flutter_webrtc internal render path
+    //    (el.muted=true + sink masterGain disconnect บางที Chrome ยัง render)
+    //    เก็บ stream ไว้ใน _savedSrcObjects เพื่อ restore ตอน unmute
+    elements.forEach(function (el) {
+      if (muted) {
+        if (el.srcObject) {
+          _savedSrcObjects.set(el, el.srcObject);
+          try { el.srcObject = null; } catch (e) {}
+        }
+      } else {
+        var saved = _savedSrcObjects.get(el);
+        if (saved && !el.srcObject) {
+          try { el.srcObject = saved; el.play().catch(function(){}); } catch (e) {}
+        }
+        _savedSrcObjects.delete(el);
+      }
+    });
+    console.log('[Opus] muted=' + muted + ' tracks=' + count +
+                ' sinks=' + _audioSink.size + ' bass=' + _bassFilters.size +
+                ' elements=' + elements.length +
+                ' ref=' + (_refAudio ? (_refAudio.muted ? 'muted' : 'live') : 'none') +
+                ' savedSrc=' + _savedSrcObjects.size);
+    window._debugAudioElements();  // เรียกทุกครั้ง — เพื่อ trace audio rendering path
+    window._diagnoseContexts();
   };
 
+  // Diagnostic: แสดง state ของทุก AudioContext เพื่อยืนยันว่า suspend จริง
+  window._diagnoseContexts = function() {
+    var report = [];
+    if (_pcmPlayCtx) report.push('pcmPlay=' + _pcmPlayCtx.state);
+    if (_pcmCaptureCtx) report.push('pcmCapture=' + _pcmCaptureCtx.state);
+    if (_simCtx) report.push('sim=' + _simCtx.state);
+    var sinkIdx = 0;
+    _audioSink.forEach(function(s) {
+      if (s.ctx) report.push('sink#' + sinkIdx + '=' + s.ctx.state);
+      sinkIdx++;
+    });
+    var bassIdx = 0;
+    _bassFilters.forEach(function(f) {
+      if (f.ctx) report.push('bass#' + bassIdx + '=' + f.ctx.state);
+      bassIdx++;
+    });
+    console.log('[CtxState]', report.join(' '));
+  };
+
+  // PCM mute — nuclear: disconnect + SUSPEND ctx เลย
+  // กัน buffer source ใดๆ ที่ connect เข้า masterGain + กัน Chrome แสดง "tab playing audio"
   window.setPcmPlaybackMuted = function (muted) {
-    if (!_pcmPlayCtx) return;
-    if (muted) { _pcmPlayCtx.suspend().catch(function(){}); }
-    else        { _pcmPlayCtx.resume().catch(function(){}); }
-    console.log('[PCM] playback ' + (muted ? 'muted' : 'unmuted'));
+    _pcmMutedState = muted;
+    if (_pcmMasterGain && _pcmPlayCtx) {
+      _pcmMasterGain.gain.value = muted ? 0 : 1;
+      try {
+        if (muted) {
+          _pcmMasterGain.disconnect();
+          _pcmPlayCtx.suspend().catch(function(){});
+        } else {
+          _pcmMasterGain.connect(_pcmPlayCtx.destination);
+          _pcmPlayCtx.resume().catch(function(){});
+        }
+      } catch (e) { /* already (dis)connected */ }
+    }
+    // Patient side — suspend PCM capture ctx + sim ctx ด้วย (ฝั่ง patient ไม่มี _pcmPlayCtx)
+    try {
+      if (_pcmCaptureCtx) {
+        if (muted) _pcmCaptureCtx.suspend().catch(function(){});
+        else _pcmCaptureCtx.resume().catch(function(){});
+      }
+      if (_simCtx) {
+        if (muted) _simCtx.suspend().catch(function(){});
+        else _simCtx.resume().catch(function(){});
+      }
+    } catch (e) {}
+    console.log('[PCM] playback ' + (muted ? 'muted (disconnected+suspended)' : 'unmuted (connected+resumed)'));
   };
 
-  // ─── DataChannel interceptor (ฝังใน PatchedPC) ──────────────
-  // เพิ่มใน PatchedPC เพื่อ intercept DataChannel อัตโนมัติ
+  // ─── Single RTCPeerConnection patch: track _pcs + intercept DataChannel ──────
+  // ห้าม patch 2 ครั้ง — ทุก PC จะถูก push เข้า _pcs ซ้ำ
   (function () {
     var _OrigPC = window.RTCPeerConnection;
-    function PatchedPC2(config) {
+    function PatchedPC(config) {
       var pc = new _OrigPC(config);
-      // Track PC ใน _pcs เพื่อให้ startJsRecording หา remote audio tracks ได้
+      // Track PC ใน _pcs เพื่อให้ startJsRecording / SimAudio inject หา sender ได้
       window._pcs = window._pcs || [];
       window._pcs.push(pc);
+      // Cleanup 2 layers: ทั้ง close() override + connectionstatechange
+      var origClose = pc.close.bind(pc);
+      pc.close = function () {
+        window._pcs = window._pcs.filter(function (p) { return p !== pc; });
+        origClose();
+      };
       pc.addEventListener('connectionstatechange', function () {
         if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
           window._pcs = window._pcs.filter(function (p) { return p !== pc; });
@@ -595,9 +887,9 @@
       });
       return pc;
     }
-    PatchedPC2.prototype = _OrigPC.prototype;
-    Object.assign(PatchedPC2, _OrigPC);
-    window.RTCPeerConnection = PatchedPC2;
+    PatchedPC.prototype = _OrigPC.prototype;
+    Object.assign(PatchedPC, _OrigPC);
+    window.RTCPeerConnection = PatchedPC;
   })();
 
   // ============================================================
@@ -612,9 +904,10 @@
       var Ctx = window.AudioContext || window.webkitAudioContext;
       if (Ctx) new Ctx().resume();
     } catch(e) {}
-    document.querySelectorAll('video').forEach(function (v) {
-      v.muted = false;
-      v.play().catch(function(){});
+    _getRemoteMediaElements().forEach(function (el) {
+      // ห้าม unmute element ที่ route ผ่าน Web Audio sink — เสียงออกจาก context อยู่แล้ว
+      if (!_audioSink.has(el) && !_bassFilters.has(el)) el.muted = false;
+      el.play().catch(function(){});
     });
     var el = document.getElementById('audio-unlock-overlay');
     if (el) { el.style.opacity = '0'; setTimeout(function(){ el.classList.remove('show'); }, 300); }
@@ -635,8 +928,8 @@
 
   var _vidObserver = new MutationObserver(function () {
     if (!_audioUnlocked) return;
-    document.querySelectorAll('video').forEach(function (v) {
-      if (v.srcObject && v.paused) v.play().catch(function(){});
+    _getRemoteMediaElements().forEach(function (el) {
+      if (el.srcObject && el.paused) el.play().catch(function(){});
     });
   });
   _vidObserver.observe(document.body, { childList: true, subtree: true, attributes: true });

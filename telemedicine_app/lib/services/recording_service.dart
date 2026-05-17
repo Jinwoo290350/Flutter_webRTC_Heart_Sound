@@ -49,6 +49,7 @@ class RecordingService extends ChangeNotifier {
   bool _usingPcmChannel = false;  // true = กำลัง record จาก DataChannel
   int _pcmMessageCount = 0;       // debug: นับ onMessage events
   int get pcmMessageCount => _pcmMessageCount;
+  RTCDataChannel? _pcmDataChannel; // A3: เก็บ ref เพื่อ clear onMessage ตอน stop
 
   // ==================== Playback state ====================
 
@@ -120,6 +121,7 @@ class RecordingService extends ChangeNotifier {
           _pcmSamples = [];
           _pcmMessageCount = 0;
           _usingPcmChannel = true;
+          _pcmDataChannel = dataChannel;  // A3: เก็บ ref เพื่อ clear onMessage ตอน stop
           dataChannel.onMessage = (msg) {
             if (_pcmSamples == null) return;
             _pcmMessageCount++;
@@ -176,6 +178,8 @@ class RecordingService extends ChangeNotifier {
               break;
             } catch (e) {
               debugPrint('RecordingService: source $source failed: $e — trying next');
+              // A4: cancel ก่อน dispose เพื่อปล่อย mic
+              try { await recorder.cancel(); } catch (_) {}
               try { await recorder.dispose(); } catch (_) {}
             }
           }
@@ -210,6 +214,9 @@ class RecordingService extends ChangeNotifier {
     } else if (_usingPcmChannel && _pcmSamples != null) {
       // PCM DataChannel path — เขียน raw Float32 samples เป็น WAV file
       try {
+        // A3: clear onMessage handler ก่อน — ไม่ให้ message ใหม่เขียน _pcmSamples ที่ null
+        _pcmDataChannel?.onMessage = null;
+        _pcmDataChannel = null;
         final samples = _pcmSamples!;
         _pcmSamples = null;
         _usingPcmChannel = false;
@@ -227,6 +234,8 @@ class RecordingService extends ChangeNotifier {
         }
       } catch (e, st) {
         debugPrint('RecordingService: PCM write error: $e\n$st');
+        _pcmDataChannel?.onMessage = null;
+        _pcmDataChannel = null;
         _pcmSamples = null;
         _usingPcmChannel = false;
       }
@@ -274,6 +283,11 @@ class RecordingService extends ChangeNotifier {
   Future<void> cancelRecording() async {
     if (!_isRecording) return;
     _isRecording = false;
+    // A3: clear DataChannel handler — ป้องกัน race
+    _pcmDataChannel?.onMessage = null;
+    _pcmDataChannel = null;
+    _pcmSamples = null;
+    _usingPcmChannel = false;
     if (kIsWeb) {
       stopJsRecording();
       _jsRecFuture = null;
@@ -286,12 +300,24 @@ class RecordingService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// ลบ recording
+  /// ลบ recording — รวมไฟล์ที่อยู่บนดิสก์ด้วย (M6)
   void deleteRecording(String id) {
-    recordings.removeWhere((r) => r.id == id);
+    final idx = recordings.indexWhere((r) => r.id == id);
+    if (idx < 0) return;
+    final rec = recordings[idx];
+    recordings.removeAt(idx);
     if (_currentlyPlayingId == id) {
       _player.stop();
       _currentlyPlayingId = null;
+    }
+    // M6: ลบไฟล์ temp บน native (web blob URL จะถูก revoke โดย browser)
+    if (!kIsWeb && !rec.isAsset && rec.path.isNotEmpty) {
+      try {
+        final f = File(rec.path);
+        if (f.existsSync()) f.deleteSync();
+      } catch (e) {
+        debugPrint('RecordingService: failed to delete file ${rec.path}: $e');
+      }
     }
     notifyListeners();
   }
@@ -390,6 +416,11 @@ class RecordingService extends ChangeNotifier {
   @override
   void dispose() {
     for (final s in _playerSubs) { s.cancel(); }
+    // N6: stop player ก่อน dispose เพื่อ clean shutdown
+    try { _player.stop(); } catch (_) {}
+    // A3: clear DataChannel handler
+    _pcmDataChannel?.onMessage = null;
+    _pcmDataChannel = null;
     _activeRecorder?.dispose();
     _player.dispose();
     super.dispose();
