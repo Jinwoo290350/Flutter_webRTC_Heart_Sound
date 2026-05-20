@@ -1,124 +1,69 @@
-// Web implementation: เรียก JS functions ที่ defined ใน index.html
+// Web implementation: เรียก JS function ที่อยู่ใน index.html
 import 'dart:js_interop';
 
+@JS('setOpusMuted')
+external void _jsSetOpusMuted(JSBoolean muted);
+
+@JS('setPcmMuted')
+external void _jsSetPcmMuted(JSBoolean muted);
+
 @JS('startSimAudio')
-external JSPromise _jsStartSim(JSString path);
+external JSPromise _jsStartSimAudio(JSString assetPath);
 
 @JS('stopSimAudio')
-external JSPromise _jsStopSim();
+external JSPromise _jsStopSimAudio();
 
-@JS('setHeartMode')
-external void _jsSetHeartMode(JSBoolean enabled);
+@JS('setBassBoost')
+external void _jsSetBassBoost(JSBoolean enabled);
 
-@JS('_retrySimInject')
-external JSPromise _jsRetryInject();
+@JS('startStethMic')
+external JSPromise _jsStartStethMic();
 
-@JS('setHeartBoost')
-external void _jsSetHeartBoost(JSNumber db);
+@JS('stopStethMic')
+external JSPromise _jsStopStethMic();
 
-@JS('playReference')
-external void _jsPlayReference(JSString path);
+@JS('startRecording')
+external JSPromise _jsStartRecording();
 
-@JS('stopReference')
-external void _jsStopReference();
+@JS('stopRecording')
+external JSPromise<JSString> _jsStopRecording();
 
-@JS('downloadRecording')
-external void _jsDownloadRecording(JSString blobUrl, JSString filename);
+void setOpusMuted(bool muted) {
+  try { _jsSetOpusMuted(muted.toJS); } catch (_) {}
+}
 
-@JS('startJsRecording')
-external JSPromise<JSString> _jsStartJsRecording();
+void setPcmMuted(bool muted) {
+  try { _jsSetPcmMuted(muted.toJS); } catch (_) {}
+}
 
-@JS('stopJsRecording')
-external void _jsStopJsRecording();
-
-@JS('startPcmCapture')
-external JSPromise _jsStartPcmCapture(JSString? deviceId);
-
-@JS('stopPcmCapture')
-external JSPromise _jsStopPcmCapture();
-
-@JS('stopPcmPlayback')
-external void _jsStopPcmPlayback();
-
-@JS('setPcmPlaybackMuted')
-external void _jsSetPcmPlaybackMuted(JSBoolean muted);
-
-@JS('setRemoteAudioMuted')
-external void _jsSetRemoteAudioMuted(JSBoolean muted);
-
-@JS('setPcmSendEnabled')
-external void _jsSetPcmSendEnabled(JSBoolean enabled);
-
-@JS('setAudioSenderEnabled')
-external void _jsSetAudioSenderEnabled(JSBoolean enabled);
-
-Future<void> startSimAudio(String path) async {
-  try { await _jsStartSim(path.toJS).toDart; } catch (_) {}
+Future<void> startSimAudio(String assetPath) async {
+  try { await _jsStartSimAudio(assetPath.toJS).toDart; } catch (_) {}
 }
 
 Future<void> stopSimAudio() async {
-  try { await _jsStopSim().toDart; } catch (_) {}
+  try { await _jsStopSimAudio().toDart; } catch (_) {}
 }
 
-void setHeartMode(bool enabled) {
-  try { _jsSetHeartMode(enabled.toJS); } catch (_) {}
+void setBassBoost(bool enabled) {
+  try { _jsSetBassBoost(enabled.toJS); } catch (_) {}
 }
 
-Future<void> retrySimInject() async {
-  try { await _jsRetryInject().toDart; } catch (_) {}
+Future<void> startStethMic() async {
+  try { await _jsStartStethMic().toDart; } catch (_) {}
 }
 
-void setHeartBoost(double db) {
-  try { _jsSetHeartBoost(db.toJS); } catch (_) {}
+Future<void> stopStethMic() async {
+  try { await _jsStopStethMic().toDart; } catch (_) {}
 }
 
-void playReference(String path) {
-  try { _jsPlayReference(path.toJS); } catch (_) {}
+Future<void> startRecording() async {
+  try { await _jsStartRecording().toDart; } catch (_) {}
 }
 
-void stopReference() {
-  try { _jsStopReference(); } catch (_) {}
-}
-
-void downloadRecording(String blobUrl, String filename) {
-  try { _jsDownloadRecording(blobUrl.toJS, filename.toJS); } catch (_) {}
-}
-
-Future<String> startJsRecording() async {
+/// returns blob URL of recorded webm/opus
+Future<String> stopRecording() async {
   try {
-    final result = await _jsStartJsRecording().toDart;
-    return result.toDart;  // JSString → Dart String (blob URL)
-  } catch (e) { return ''; }
-}
-
-void stopJsRecording() {
-  try { _jsStopJsRecording(); } catch (_) {}
-}
-
-Future<void> startPcmCapture({String? deviceId}) async {
-  try { await _jsStartPcmCapture(deviceId?.toJS).toDart; } catch (_) {}
-}
-
-Future<void> stopPcmCapture() async {
-  try { await _jsStopPcmCapture().toDart; } catch (_) {}
-}
-
-void stopPcmPlayback() {
-  try { _jsStopPcmPlayback(); } catch (_) {}
-}
-
-void setPcmPlaybackMuted(bool muted) {
-  try { _jsSetPcmPlaybackMuted(muted.toJS); } catch (_) {}
-}
-
-void setRemoteAudioMuted(bool muted) {
-  try { _jsSetRemoteAudioMuted(muted.toJS); } catch (_) {}
-}
-
-void setPcmSendEnabled(bool enabled) {
-  try { _jsSetPcmSendEnabled(enabled.toJS); } catch (_) {}
-}
-
-void setAudioSenderEnabled(bool enabled) {
-  try { _jsSetAudioSenderEnabled(enabled.toJS); } catch (_) {}
+    final result = await _jsStopRecording().toDart;
+    return result.toDart;
+  } catch (_) { return ''; }
 }

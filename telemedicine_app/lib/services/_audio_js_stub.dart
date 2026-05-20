@@ -1,18 +1,10 @@
-// Stub สำหรับ platform ที่ไม่ใช่ web (Android, iOS, desktop)
-Future<void> startSimAudio(String path) async {}
+// Stub สำหรับ platform ที่ไม่ใช่ web
+void setOpusMuted(bool muted) {}
+void setPcmMuted(bool muted) {}
+Future<void> startSimAudio(String assetPath) async {}
 Future<void> stopSimAudio() async {}
-void setHeartMode(bool enabled) {}
-Future<void> retrySimInject() async {}
-void setHeartBoost(double db) {}
-void playReference(String path) {}
-void stopReference() {}
-void downloadRecording(String blobUrl, String filename) {}
-Future<String> startJsRecording() async => '';
-void stopJsRecording() {}
-Future<void> startPcmCapture({String? deviceId}) async {}
-Future<void> stopPcmCapture() async {}
-void stopPcmPlayback() {}
-void setPcmPlaybackMuted(bool muted) {}
-void setRemoteAudioMuted(bool muted) {}
-void setPcmSendEnabled(bool enabled) {}
-void setAudioSenderEnabled(bool enabled) {}
+void setBassBoost(bool enabled) {}
+Future<void> startStethMic() async {}
+Future<void> stopStethMic() async {}
+Future<void> startRecording() async {}
+Future<String> stopRecording() async => '';

@@ -1,5 +1,5 @@
 name: telemedicine_app
-description: "ระบบ telemedicine video call พร้อมส่งเสียงหัวใจจาก stethoscope"
+description: "ระบบ telemedicine video call (clean base — heart sound feature to be rebuilt)"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -10,36 +10,21 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # WebRTC native binding — ควบคุม audio pipeline ได้ทุกชั้น
+  # WebRTC native binding
   flutter_webrtc: ^0.12.0
 
-  # Firebase Firestore สำหรับ signaling (แลก offer/answer/ICE candidates)
+  # Firebase Firestore — signaling
   firebase_core: ^3.0.0
   cloud_firestore: ^5.0.0
 
-  # ขอ permission กล้อง/ไมค์ในรันไทม์
+  # Runtime camera/mic permission
   permission_handler: ^11.0.0
 
   # State management
   provider: ^6.0.0
 
-  # เก็บไฟล์ recording ใน local storage
-  path_provider: ^2.1.0
-
-  # เล่น recording เสียงหัวใจ
-  audioplayers: ^6.0.0
-
-  # configure AudioSession ก่อน WebRTC — ปิด voice processing ระดับ OS
+  # AudioSession config (iOS/Android) ก่อน WebRTC
   audio_session: ^0.1.21
-
-  # Firebase Storage — อัพโหลด recording จากคนไข้ไปเก็บ cloud
-  firebase_storage: ^12.0.0
-
-  # record package — บันทึก mic ฝั่งคนไข้ (filter OFF, fullband)
-  record: ^6.2.0
-
-  # share file บน native (Android/iOS)
-  share_plus: ^10.0.0
 
   cupertino_icons: ^1.0.8
 
@@ -50,32 +35,6 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  # Heart sound assets — kept for Phase 3 rebuild (not used in current clean base)
   assets:
     - assets/heart_sounds/
-    - assets/heart_sounds/aortic_0.wav
-    - assets/heart_sounds/aortic_1.wav
-    - assets/heart_sounds/aortic_2.wav
-    - assets/heart_sounds/aortic_3.wav
-    - assets/heart_sounds/aortic_4.wav
-    - assets/heart_sounds/aortic_5.wav
-    - assets/heart_sounds/mitral_0.wav
-    - assets/heart_sounds/mitral_2.wav
-    - assets/heart_sounds/mitral_3.wav
-    - assets/heart_sounds/mitral_4.wav
-    - assets/heart_sounds/mitral_5.wav
-    - assets/heart_sounds/pulmonary_0.wav
-    - assets/heart_sounds/pulmonary_1.wav
-    - assets/heart_sounds/pulmonary_2.wav
-    - assets/heart_sounds/pulmonary_3.wav
-    - assets/heart_sounds/pulmonary_4.wav
-    - assets/heart_sounds/pulmonary_5.wav
-    - assets/heart_sounds/tricuspid_0.wav
-    - assets/heart_sounds/tricuspid_1.wav
-    - assets/heart_sounds/tricuspid_3.wav
-    - assets/heart_sounds/tricuspid_4.wav
-    - assets/heart_sounds/tricuspid_5.wav
-    # Best quality samples (top score จาก analysis)
-    - assets/heart_sounds/aortic_best.wav
-    - assets/heart_sounds/mitral_best.wav
-    - assets/heart_sounds/pulmonary_best.wav
-    - assets/heart_sounds/tricuspid_best.wav

@@ -38,35 +38,24 @@ class WebRTCConfig {
     'video': true,
   };
 
-  /// Phase 2 (เตรียมไว้): เสียงหัวใจ — ปิด filter ทั้งหมด
-  /// ใช้ {exact: false} บังคับปิดจริงบน Android Chrome 72+
-  static Map<String, dynamic> stethoscopeConstraints(String deviceId) => {
-    'audio': {
-      'deviceId': {'exact': deviceId},
-      'echoCancellation': {'exact': false},
-      'noiseSuppression': {'exact': false},
-      'autoGainControl': {'exact': false},
-      // Google-specific constraints สำหรับ Android WebRTC
-      'googHighpassFilter': false,
-      'googNoiseSuppression': false,
-      'googAutoGainControl': false,
-      'googEchoCancellation': false,
-    },
-    'video': false,
-  };
-
   // ==================== SDP Manipulation ====================
 
-  /// Modify SDP:
-  /// 1. บังคับ Opus fullband 48kHz — ป้องกัน fall back เป็น narrowband
-  /// 2. จำกัด video bandwidth 500 kbps — ให้ audio มี priority บนเน็ตช้า
+  /// Modify SDP — voice-optimized (Line/IG-grade) + cap video bandwidth
+  ///
+  /// Opus = voice เท่านั้น (heart sound แยกไป PCM DataChannel)
+  ///   maxplaybackrate=48000  → fullband 48kHz (ไม่ fall back narrowband)
+  ///   sprop-maxcapturerate=48000 → encoder ใช้ 48kHz
+  ///   stereo=0; sprop-stereo=0 → mono ประหยัด bandwidth
+  ///   usedtx=0  → DTX OFF — กันเสียงตัดท้ายประโยค (continuous transmission)
+  ///              VBR + FEC ยังเปิด default
   static String modifySdp(String sdp) {
-    // Opus fullband 48kHz
+    const opusParams = 'usedtx=0;maxplaybackrate=48000;sprop-maxcapturerate=48000;'
+        'stereo=0;sprop-stereo=0';
     String result = sdp.replaceAllMapped(
       RegExp(r'(a=fmtp:\d+ .*)'),
-      (m) => '${m[1]};maxplaybackrate=48000;sprop-maxcapturerate=48000',
+      (m) => '${m[1]};$opusParams',
     );
-    // จำกัด video bitrate 500 kbps (เน็ตแย่ยังดูได้ audio ไม่แย่ง bandwidth)
+    // จำกัด video bitrate 500 kbps — audio priority บนเน็ตช้า
     result = result.replaceAllMapped(
       RegExp(r'(m=video [^\r\n]*)'),
       (m) => '${m[1]}\r\nb=AS:500',
@@ -74,6 +63,6 @@ class WebRTCConfig {
     return result;
   }
 
-  /// ชื่อเดิม — backward compat (alias ไป modifySdp)
+  /// Backward compat alias
   static String forceOpusFullband(String sdp) => modifySdp(sdp);
 }

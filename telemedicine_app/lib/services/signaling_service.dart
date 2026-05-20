@@ -177,59 +177,30 @@ class SignalingService {
     ));
   }
 
-  /// Patient ส่งสัญญาณ heartMode ไปยัง doctor ผ่าน Firestore
-  /// [enabled]: true = เริ่ม heart mode, false = หยุด
-  Future<void> setHeartMode(bool enabled) async {
+  /// Patient → Doctor: ประกาศว่ากำลังส่งเสียงหัวใจ + ระบุตำแหน่ง
+  /// Doctor ใช้แสดง banner "Heart Mode: Aortic"
+  Future<void> setHeartMode(bool enabled, [String? position]) async {
     if (_roomRef == null) return;
-    await _roomRef!.update({
-      'heartMode': enabled,
-      'heartModeAt': enabled ? FieldValue.serverTimestamp() : null,
-    });
-    debugPrint('[Signaling] heartMode → $enabled');
+    try {
+      await _roomRef!.update({
+        'heartMode': enabled,
+        'heartPosition': enabled ? position : null,
+      });
+    } catch (e) {
+      debugPrint('[Signaling] setHeartMode error: $e');
+    }
   }
 
-  /// Doctor ฟัง heartMode signal จาก patient
-  void listenForHeartMode(void Function(bool enabled) onChanged) {
+  void listenForHeartMode(void Function(bool enabled, String? position) onChanged) {
     _addSub('heartMode', _roomRef!.snapshots().listen(
       (snapshot) {
         if (!snapshot.exists) return;
         final data = snapshot.data() as Map<String, dynamic>;
-        final val = data['heartMode'];
-        if (val is bool) onChanged(val);
+        final enabled = data['heartMode'] == true;
+        final position = data['heartPosition'] as String?;
+        onChanged(enabled, position);
       },
       onError: (e) => debugPrint('[Signaling] listenForHeartMode error: $e'),
-    ));
-  }
-
-  /// ส่งคำขอ "ฉันไม่อยากได้ยินเสียง peer แล้ว" → peer หยุดส่ง audio
-  /// [myRole]: 'doctor' หรือ 'patient' — ฝั่งที่กดปุ่ม mute
-  ///
-  /// เขียนลง field:
-  ///   doctor กด mute → doctorIncomingMute=true → patient stop sending
-  ///   patient กด mute → patientIncomingMute=true → doctor stop sending
-  Future<void> setRemoteIncomingMute(String myRole, bool muted) async {
-    if (_roomRef == null) return;
-    final field = myRole == 'doctor' ? 'doctorIncomingMute' : 'patientIncomingMute';
-    try {
-      await _roomRef!.update({field: muted});
-      debugPrint('[Signaling] $field → $muted');
-    } catch (e) {
-      debugPrint('[Signaling] setRemoteIncomingMute error: $e');
-    }
-  }
-
-  /// ฟัง mute request จาก peer — ถ้า peer ขอ mute เราต้องหยุดส่ง audio
-  /// [myRole]: role ของตัวเอง — เราฟัง field ของ peer
-  void listenForPeerMuteRequest(String myRole, void Function(bool muted) onChanged) {
-    final field = myRole == 'doctor' ? 'patientIncomingMute' : 'doctorIncomingMute';
-    _addSub('peerMute', _roomRef!.snapshots().listen(
-      (snapshot) {
-        if (!snapshot.exists) return;
-        final data = snapshot.data() as Map<String, dynamic>;
-        final val = data[field];
-        if (val is bool) onChanged(val);
-      },
-      onError: (e) => debugPrint('[Signaling] listenForPeerMuteRequest error: $e'),
     ));
   }
 

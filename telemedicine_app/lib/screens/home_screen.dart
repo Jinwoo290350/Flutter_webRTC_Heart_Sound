@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'patient/patient_call_screen.dart';
 import 'doctor/doctor_call_screen.dart';
-import 'heart_sound_sample_screen.dart';
 
 /// หน้าหลัก — เลือกว่าเป็น "คนไข้" หรือ "หมอ"
 class HomeScreen extends StatelessWidget {
@@ -74,21 +73,6 @@ class HomeScreen extends StatelessWidget {
                 ),
               ),
 
-              const SizedBox(height: 16),
-
-              // ปุ่มตัวอย่างเสียงหัวใจ
-              _RoleButton(
-                icon: Icons.hearing,
-                label: 'ตัวอย่างเสียงหัวใจ',
-                subtitle: 'ฟังเสียงหัวใจปกติ 4 ตำแหน่ง (Aortic, Mitral, Pulmonary, Tricuspid)',
-                color: const Color(0xFF6A1B9A),
-                onTap: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => const HeartSoundSampleScreen(),
-                  ),
-                ),
-              ),
             ],
           ),
         ),

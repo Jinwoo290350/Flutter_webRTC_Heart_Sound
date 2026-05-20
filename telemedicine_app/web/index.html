@@ -43,817 +43,21 @@
 
   <script>
   // ============================================================
-  // 1. RTCPeerConnection interceptor — moved to single patch below
-  //    (PatchedPC ตัวเดียวจัดการ: track _pcs, override close, intercept DataChannel)
-  //    ห้าม patch 2 ครั้งเพราะ wrapper-of-wrapper push PC เข้า _pcs ซ้ำ
+  // Architecture:
+  //   Voice = Opus track (default Line/IG-grade quality)
+  //   Heart sound = PCM DataChannel only (lossless, separate from Opus)
+  //   No replaceTrack, no duplicate getUserMedia
   // ============================================================
+
   window._pcs = [];
+  function _uniquePcs() { return Array.from(new Set(window._pcs || [])); }
 
-  // ============================================================
-  // 2. Simulation audio injection
-  //    เล่น WAV asset และ inject เข้า WebRTC audio track
-  //    แทนที่จะเล่นออก speaker อย่างเดียว
-  // ============================================================
-  var _simSrc       = null;  // AudioBufferSourceNode — แทน HTMLAudioElement
-  var _simCtx       = null;
-  var _simOrigTrack = null;
-  var _simNewTrack  = null;
-  var _simBufferCache = {};  // path → decoded AudioBuffer (re-use ไม่ต้อง decode ใหม่)
-
-  // helper: dedupe _pcs (double-patch อาจ push entry ซ้ำใน window._pcs)
-  function _uniquePcs() {
-    return Array.from(new Set(window._pcs || []));
-  }
-
-  // sender-side mute flag — บังคับ track.enabled ทุกตัว (รวม SimAudio replacement track)
-  // ป้องกัน bug: หลัง replaceTrack(_simNewTrack), track ใหม่ default enabled=true แม้ peer อยู่ใน mute state
-  var _audioSenderEnabled = true;
-  window.setAudioSenderEnabled = function (enabled) {
-    _audioSenderEnabled = !!enabled;
-    if (_simNewTrack) _simNewTrack.enabled = _audioSenderEnabled;
-    if (_simOrigTrack) _simOrigTrack.enabled = _audioSenderEnabled;
-    // aggressive: iterate ALL senders ทุก PC — กัน track ที่ Dart ไม่เห็น
-    var touched = 0;
-    for (var pc of (window._pcs || [])) {
-      try {
-        for (var s of pc.getSenders()) {
-          if (s.track && s.track.kind === 'audio') {
-            s.track.enabled = _audioSenderEnabled;
-            touched++;
-          }
-        }
-      } catch (e) {}
-    }
-    console.log('[AudioSender] enabled=' + _audioSenderEnabled +
-                ' simNew=' + (_simNewTrack ? _simNewTrack.enabled : 'n/a') +
-                ' simOrig=' + (_simOrigTrack ? _simOrigTrack.enabled : 'n/a') +
-                ' senders=' + touched);
-  };
-
-  window.startSimAudio = async function (assetPath) {
-    try {
-      // หยุดอันเก่าก่อน
-      if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc.disconnect(); _simSrc = null; }
-      if (_simCtx) { await _simCtx.close(); _simCtx = null; }
-
-      var ctx = new (window.AudioContext || window.webkitAudioContext)();
-      await ctx.resume();
-
-      // BufferSource approach — ไม่มี implicit speaker output ได้แน่นอน
-      var url = new URL(assetPath, window.location.href).href;
-      var audioBuffer = _simBufferCache[url];
-      if (!audioBuffer) {
-        var response = await fetch(url);
-        var arrayBuffer = await response.arrayBuffer();
-        audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-        _simBufferCache[url] = audioBuffer;
-      }
-
-      var src  = ctx.createBufferSource();
-      src.buffer = audioBuffer;
-      src.loop = true;
-      var dest = ctx.createMediaStreamDestination();
-      src.connect(dest);  // ONLY MediaStreamDestination — no speaker path
-      src.start();
-      _simStream = dest.stream;
-
-      _simSrc      = src;
-      _simCtx      = ctx;
-      _simNewTrack = dest.stream.getAudioTracks()[0];
-      _simNewTrack.enabled = _audioSenderEnabled;
-      // ถ้า peer สั่ง mute แล้ว → suspend sim ctx ทันที (กัน leak ไป speaker บน patient tab)
-      if (_opusMutedState || _pcmMutedState) {
-        ctx.suspend().catch(function(){});
-      }
-
-      // inject เข้าทุก RTCPeerConnection ที่เปิดอยู่ (dedupe เพื่อไม่ iterate ซ้ำ)
-      var injected = false;
-      for (var pc of _uniquePcs()) {
-        for (var sender of pc.getSenders()) {
-          if (sender.track && sender.track.kind === 'audio' &&
-              sender.track !== _simNewTrack) {  // skip ถ้าเคย replace แล้ว
-            _simOrigTrack = sender.track;
-            await sender.replaceTrack(_simNewTrack);
-            // defensive: บางครั้ง Chrome reset enabled state หลัง replaceTrack — re-apply
-            sender.track.enabled = _audioSenderEnabled;
-            window.reroutePcmCapture(_simStream);
-            injected = true;
-            console.log('[SimAudio] ✅ injected (sender.track.enabled=' + sender.track.enabled + ')');
-            break;
-          }
-        }
-      }
-      if (!injected) {
-        console.warn('[SimAudio] ⚠️ no audio sender found — will retry on next call connect');
-      }
-    } catch (e) {
-      console.error('[SimAudio] error:', e);
-    }
-  };
-
-  // เรียกใหม่เมื่อ PC เชื่อมต่อสำเร็จ (กรณี sim เริ่มก่อน call)
-  window._retrySimInject = async function () {
-    if (!_simNewTrack) return;
-    _simNewTrack.enabled = _audioSenderEnabled;
-    for (var pc of _uniquePcs()) {
-      for (var sender of pc.getSenders()) {
-        if (sender.track && sender.track.kind === 'audio' &&
-            sender.track !== _simNewTrack) {
-          _simOrigTrack = sender.track;
-          await sender.replaceTrack(_simNewTrack);
-          sender.track.enabled = _audioSenderEnabled; // defensive re-apply
-          console.log('[SimAudio] ✅ retried inject (enabled=' + sender.track.enabled + ')');
-        }
-      }
-    }
-  };
-
-  window.stopSimAudio = async function () {
-    try {
-      if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc.disconnect(); _simSrc = null; }
-      if (_simCtx) { await _simCtx.close(); _simCtx = null; }
-
-      // คืน track เดิม
-      if (_simOrigTrack && _simNewTrack) {
-        // respect current sender mute state กับ track ที่จะ restore กลับมา
-        _simOrigTrack.enabled = _audioSenderEnabled;
-        for (var pc of _uniquePcs()) {
-          for (var sender of pc.getSenders()) {
-            if (sender.track === _simNewTrack) {
-              await sender.replaceTrack(_simOrigTrack);
-              window.reroutePcmCapture(null); // กลับมาใช้ mic stream ใน DataChannel path
-              console.log('[SimAudio] ✅ restored original mic track');
-            }
-          }
-        }
-      }
-      _simOrigTrack = null;
-      _simNewTrack  = null;
-    } catch (e) {
-      console.error('[SimAudio] stop error:', e);
-    }
-  };
-
-  // ============================================================
-  // 3. Bass boost (receiver side — หมอ)
-  //    boost ความถี่ต่ำ 20-500Hz ก่อนเล่นออกหูฟัง
-  //    ชดเชย iOS HPF ที่ตัดความถี่ต่ำออก
-  // ============================================================
-  var _heartMode    = false;
-  var _bassBoostDb  = 8; // default boost level (dB) — ลดจาก 15 เพราะ Android clipping
-  var _bassFilters  = new Map(); // videoElement → {ctx, shelf, peak80, peak200, masterGain}
-
-  // Mute states (sync ตอนสร้าง context ใหม่)
-  var _opusMutedState = false;
-  var _pcmMutedState  = false;
-  var _pcmMasterGain  = null;
-
-  window.setHeartMode = function (enabled) {
-    _heartMode = enabled;
-    if (enabled) { _applyBassBoostAll(); }
-    else { _removeBassBoostAll(); }
-  };
-
-  // ปรับ boost real-time (เรียกจาก slider ใน Flutter)
-  window.setHeartBoost = function (db) {
-    _bassBoostDb = db;
-    _bassFilters.forEach(function (f) {
-      f.shelf.gain.value  = db;
-      f.peak80.gain.value = db * 0.7;
-      f.peak200.gain.value = db * 0.5;
-    });
-  };
-
-  function _applyBassBoostAll() {
-    _getRemoteMediaElements().forEach(function (el) {
-      if (el.srcObject && el.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(el)) {
-        _applyBassBoost(el);
-      }
-    });
-  }
-
-  function _applyBassBoost(videoEl) {
-    // detach always-on sink ก่อน เพื่อไม่ route ซ้อน
-    if (_audioSink.has(videoEl)) _detachAudioSink(videoEl);
-    try {
-      var ctx = new (window.AudioContext || window.webkitAudioContext)();
-      var src   = ctx.createMediaStreamSource(videoEl.srcObject);
-      var shelf = ctx.createBiquadFilter();
-      shelf.type = 'lowshelf'; shelf.frequency.value = 500; shelf.gain.value = _bassBoostDb;
-      var peak80 = ctx.createBiquadFilter();
-      peak80.type = 'peaking'; peak80.frequency.value = 80; peak80.Q.value = 0.7; peak80.gain.value = _bassBoostDb * 0.7;
-      var peak200 = ctx.createBiquadFilter();
-      peak200.type = 'peaking'; peak200.frequency.value = 200; peak200.Q.value = 0.7; peak200.gain.value = _bassBoostDb * 0.5;
-      // Limiter — ป้องกัน clipping บน Android speaker ที่รับ bass boost ไม่ไหว
-      var limiter = ctx.createDynamicsCompressor();
-      limiter.threshold.value = -3;
-      limiter.knee.value      = 0;
-      limiter.ratio.value     = 20;
-      limiter.attack.value    = 0.001;
-      limiter.release.value   = 0.1;
-      // master gain ก่อน destination เพื่อ instant mute
-      var masterGain = ctx.createGain();
-      masterGain.gain.value = _opusMutedState ? 0 : 1;
-      src.connect(shelf); shelf.connect(peak80); peak80.connect(peak200);
-      peak200.connect(limiter); limiter.connect(masterGain);
-      // Conditional connect + suspend ถ้า muted
-      if (_opusMutedState) {
-        ctx.suspend().catch(function(){});
-      } else {
-        masterGain.connect(ctx.destination);
-        ctx.resume().catch(function(){});
-      }
-      videoEl.muted = true;
-      _bassFilters.set(videoEl, { ctx: ctx, shelf: shelf, peak80: peak80, peak200: peak200, masterGain: masterGain });
-      console.log('[BassBoost] ✅ applied ' + _bassBoostDb + 'dB (muted=' + _opusMutedState + ', connected=' + !_opusMutedState + ')');
-    } catch (e) { console.error('[BassBoost] error:', e); }
-  }
-
-  function _removeBassBoostAll() {
-    _bassFilters.forEach(function (f, videoEl) {
-      f.ctx.close().catch(function(){});
-      // ไม่ unmute ที่นี่ — ปล่อยให้ _attachAudioSink() ตั้ง videoEl.muted=true ต่อ
-    });
-    _bassFilters.clear();
-    // attach always-on sink ทันที (ไม่ต้องรอ interval)
-    _getRemoteMediaElements().forEach(_attachAudioSink);
-  }
-
-  // ============================================================
-  // 3.5 Always-On Audio Sink — route ทุก remote audio ผ่าน Web Audio
-  //     เพื่อให้ mute เป็น deterministic ไม่ขึ้นกับ element.muted ที่อาจถูก reset
-  //
-  // CRITICAL: flutter_webrtc สร้าง <audio> ใน #html_webrtc_audio_manager_list
-  //          (display:none div) ไม่ใช่ <video>! ต้อง target ทั้ง audio และ video
-  // ============================================================
-  var _audioSink = new Map();  // mediaElement → { ctx, masterGain }
-  var _savedSrcObjects = new Map();  // mediaElement → stream (saved ตอน mute, restore ตอน unmute)
-
-  function _getRemoteMediaElements() {
-    // หา audio + video element ทุกที่ใน DOM (flutter_webrtc อาจสร้างใน hidden div)
-    var arr = [];
-    document.querySelectorAll('audio').forEach(function(e) { arr.push(e); });
-    document.querySelectorAll('video').forEach(function(e) { arr.push(e); });
-    return arr;
-  }
-
-  // Debug: log สิ่งที่อยู่ใน DOM ตอน mute
-  window._debugAudioElements = function () {
-    var audios = Array.from(document.querySelectorAll('audio'));
-    var videos = Array.from(document.querySelectorAll('video'));
-    console.log('[DEBUG] audios=' + audios.length + ' ids=' + audios.map(function(a){return a.id||'(no-id)';}).join(','));
-    console.log('[DEBUG] videos=' + videos.length + ' ids=' + videos.map(function(v){return v.id||'(no-id)';}).join(','));
-    audios.concat(videos).forEach(function (el) {
-      var atracks = el.srcObject ? el.srcObject.getAudioTracks().length : 0;
-      var sink = _audioSink.has(el) ? 'YES' : 'no';
-      var bass = _bassFilters.has(el) ? 'YES' : 'no';
-      console.log('[DEBUG] ' + el.tagName + '#' + (el.id||'(no-id)') +
-                  ' srcObject=' + !!el.srcObject + ' atracks=' + atracks +
-                  ' muted=' + el.muted + ' volume=' + el.volume + ' paused=' + el.paused +
-                  ' sink=' + sink + ' bass=' + bass);
-    });
-  };
-
-  function _attachAudioSink(el) {
-    if (_audioSink.has(el)) return;
-    if (_bassFilters.has(el)) return;  // bass boost จัดการ routing เองแล้ว
-    if (!el.srcObject || el.srcObject.getAudioTracks().length === 0) return;
-    try {
-      var ctx = new (window.AudioContext || window.webkitAudioContext)();
-      var src = ctx.createMediaStreamSource(el.srcObject);
-      var masterGain = ctx.createGain();
-      masterGain.gain.value = _opusMutedState ? 0 : 1;
-      src.connect(masterGain);
-      // Conditional connect: ถ้า muted, ไม่ connect ไป destination เลย → Chrome ไม่นับว่า tab playing audio
-      if (_opusMutedState) {
-        ctx.suspend().catch(function(){});  // suspend context ทั้งหมด
-      } else {
-        masterGain.connect(ctx.destination);
-        ctx.resume().catch(function(){});
-      }
-      el.muted = true;  // ป้องกัน direct output — เสียงผ่าน context เท่านั้น
-      _audioSink.set(el, { ctx: ctx, masterGain: masterGain });
-      console.log('[AudioSink] ✅ attached to ' + el.tagName + ' (muted=' + _opusMutedState + ', connected=' + !_opusMutedState + ')');
-    } catch (e) {
-      console.error('[AudioSink] error:', e);
-    }
-  }
-
-  function _detachAudioSink(el) {
-    var sink = _audioSink.get(el);
-    if (!sink) return;
-    sink.ctx.close().catch(function(){});
-    _audioSink.delete(el);
-  }
-
-  // Auto-attach interval — เก็บ media element ใหม่และ cleanup ที่หายไป
-  // + enforcement: ถ้า element มี sink/bass แล้ว → คง el.muted=true เสมอ
-  //   (flutter_webrtc อาจ reset muted=false เมื่อ stream เปลี่ยน)
-  setInterval(function () {
-    var elements = _getRemoteMediaElements();
-    if (_heartMode) {
-      elements.forEach(function (el) {
-        if (el.srcObject && el.srcObject.getAudioTracks().length > 0 && !_bassFilters.has(el)) {
-          _applyBassBoost(el);
-        }
-      });
-    } else {
-      // Normal mode — attach always-on sink
-      elements.forEach(function (el) {
-        if (el.srcObject && el.srcObject.getAudioTracks().length > 0) {
-          _attachAudioSink(el);
-        } else if (_audioSink.has(el)) {
-          _detachAudioSink(el);
-        }
-      });
-    }
-    // enforcement loop — กัน flutter_webrtc reset el.muted / restore srcObject
-    elements.forEach(function (el) {
-      if (_audioSink.has(el) || _bassFilters.has(el)) {
-        if (el.muted !== true) el.muted = true;
-        if (_opusMutedState && el.volume !== 0) el.volume = 0;
-      } else if (_opusMutedState) {
-        if (el.muted !== true) el.muted = true;
-        if (el.volume !== 0) el.volume = 0;
-      }
-      // re-assert srcObject=null ตอน muted (กัน flutter_webrtc re-attach stream)
-      if (_opusMutedState && el.srcObject) {
-        if (!_savedSrcObjects.has(el)) _savedSrcObjects.set(el, el.srcObject);
-        try { el.srcObject = null; } catch (e) {}
-      }
-    });
-  }, 800);
-
-  // ============================================================
-  // 5. Reference sound player (หมอเปรียบเทียบกับเสียงปกติ)
-  // ============================================================
-  var _refAudio = null;
-
-  window.playReference = function (assetPath) {
-    if (_refAudio) { _refAudio.pause(); _refAudio = null; }
-    var url = new URL('assets/' + assetPath, window.location.href).href;
-    _refAudio = new Audio(url);
-    _refAudio.loop = true;
-    // respect current mute state
-    _refAudio.muted  = _opusMutedState;
-    _refAudio.volume = _opusMutedState ? 0 : 1;
-    _refAudio.play().catch(function (e) { console.error('[Ref]', e); });
-    console.log('[Ref] play (muted=' + _refAudio.muted + ')');
-  };
-
-  window.stopReference = function () {
-    if (_refAudio) { _refAudio.pause(); _refAudio = null; }
-  };
-
-  // ==================== JS-side Recording ====================
-  // record จาก remote video element โดยตรง (ไม่ผ่าน flutter_webrtc MediaRecorder)
-  var _jsRecorder   = null;
-  var _jsChunks     = [];
-  var _jsRecResolve = null;
-
-  window.startJsRecording = function () {
-    return new Promise(function (resolve, reject) {
-      // ดึง remote audio tracks จาก RTCPeerConnection โดยตรง (ไม่พึ่ง DOM video element)
-      var pcs = _uniquePcs();
-      console.log('[JsRec] _pcs count:', pcs.length);
-
-      var audioStream = new MediaStream();
-      pcs.forEach(function (pc, pi) {
-        var receivers = pc.getReceivers();
-        console.log('[JsRec] pc[' + pi + '] receivers:', receivers.length);
-        receivers.forEach(function (receiver) {
-          if (receiver.track && receiver.track.kind === 'audio') {
-            audioStream.addTrack(receiver.track);
-            console.log('[JsRec] pc[' + pi + '] → added audio track id=' + receiver.track.id
-                        + ' enabled=' + receiver.track.enabled
-                        + ' readyState=' + receiver.track.readyState);
-          }
-        });
-      });
-
-      var trackCount = audioStream.getAudioTracks().length;
-      console.log('[JsRec] total remote audio tracks collected:', trackCount);
-
-      if (trackCount === 0) {
-        console.error('[JsRec] ❌ no remote audio tracks — call not connected yet or _pcs empty');
-        reject('no remote audio tracks found');
-        return;
-      }
-
-      // mimeType fallback chain: opus → plain webm → no constraint
-      var mimeType = '';
-      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-        mimeType = 'audio/webm;codecs=opus';
-      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
-        mimeType = 'audio/webm';
-      } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
-        mimeType = 'audio/ogg;codecs=opus';
-      }
-      console.log('[JsRec] mimeType selected:', mimeType || '(browser default)');
-
-      _jsChunks     = [];
-      _jsRecResolve = resolve;
-      try {
-        _jsRecorder = mimeType
-          ? new MediaRecorder(audioStream, { mimeType: mimeType })
-          : new MediaRecorder(audioStream);
-      } catch (e) {
-        console.error('[JsRec] MediaRecorder init error:', e);
-        reject('MediaRecorder init failed: ' + e);
-        return;
-      }
-
-      _jsRecorder.ondataavailable = function (e) {
-        if (e.data && e.data.size > 0) _jsChunks.push(e.data);
-      };
-      _jsRecorder.onstop = function () {
-        var blobType = mimeType || 'audio/webm';
-        var blob     = new Blob(_jsChunks, { type: blobType });
-        var blobUrl  = URL.createObjectURL(blob);
-        console.log('[JsRec] ■ stopped blobUrl=' + blobUrl + ' size=' + blob.size + ' chunks=' + _jsChunks.length);
-        if (_jsRecResolve) { _jsRecResolve(blobUrl); _jsRecResolve = null; }
-      };
-      _jsRecorder.onerror = function (e) {
-        console.error('[JsRec] MediaRecorder error:', e);
-        if (_jsRecResolve) { _jsRecResolve(''); _jsRecResolve = null; }
-      };
-      _jsRecorder.start(100);
-      console.log('[JsRec] ▶ started mimeType=' + (mimeType || 'browser-default') + ' tracks=' + trackCount);
-    });
-  };
-
-  window.stopJsRecording = function () {
-    if (_jsRecorder && _jsRecorder.state !== 'inactive') {
-      _jsRecorder.stop();
-      _jsRecorder = null;
-    }
-  };
-
-  // ดาวน์โหลด recording blob URL — เรียกจาก Flutter
-  window.downloadRecording = function (blobUrl, filename) {
-    var a = document.createElement('a');
-    a.href = blobUrl;
-    a.download = filename || 'heart_sound.webm';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
-
-  // ============================================================
-  // 6. DataChannel raw PCM — 0 dB loss heart sound streaming
-  //    Patient : AudioWorklet → Float32 20ms chunks → DataChannel
-  //    Doctor  : DataChannel → jitter buffer → Web Audio playback
-  // ============================================================
-
-  // AudioWorklet processor (loaded via Blob URL — no separate file needed)
-  var _pcmWorkletSrc = [
-    "class StethCapture extends AudioWorkletProcessor {",
-    "  constructor() { super(); this._buf = new Float32Array(960); this._pos = 0; }",
-    "  process(inputs) {",
-    "    var ch = inputs[0] && inputs[0][0];",
-    "    if (!ch) return true;",
-    "    for (var i = 0; i < ch.length; i++) {",
-    "      this._buf[this._pos++] = ch[i];",
-    "      if (this._pos === 960) {",       // 20 ms @ 48 kHz
-    "        this.port.postMessage(this._buf.buffer, [this._buf.buffer]);",
-    "        this._buf = new Float32Array(960); this._pos = 0;",
-    "      }",
-    "    }",
-    "    return true;",
-    "  }",
-    "}",
-    "registerProcessor('steth-capture', StethCapture);"
-  ].join('\n');
-
-  var _pcmCaptureCtx  = null;
-  var _pcmCaptureNode = null;
-  var _pcmChannel     = null; // RTCDataChannel — set by interceptor
-  var _pcmSrcNode     = null; // current Web Audio source node connected to worklet
-  var _pcmMicStream   = null; // getUserMedia stream (kept for rerouting back)
-  var _simStream      = null; // SimAudio dest.stream (kept for rerouting)
-  var _pcmSendEnabled = true; // sender-side mute gate — set โดย setPcmSendEnabled()
-
-  // Sender-side mute: ถ้า peer ขอ mute มา หยุดส่ง PCM DataChannel chunks
-  window.setPcmSendEnabled = function (enabled) {
-    _pcmSendEnabled = !!enabled;
-    console.log('[PCM] send gate → ' + (_pcmSendEnabled ? 'OPEN' : 'CLOSED'));
-  };
-
-  // สลับ audio source ที่ส่งเข้า PCM worklet โดยไม่ restart worklet
-  window.reroutePcmCapture = function (stream) {
-    if (!_pcmCaptureCtx || !_pcmCaptureNode) return;
-    if (_pcmSrcNode) { _pcmSrcNode.disconnect(); _pcmSrcNode = null; }
-    var target = stream || _pcmMicStream;
-    if (!target) return;
-    _pcmSrcNode = _pcmCaptureCtx.createMediaStreamSource(target);
-    _pcmSrcNode.connect(_pcmCaptureNode);
-    console.log('[PCM] rerouted to ' + (stream ? 'sim audio' : 'mic'));
-  };
-
-  // ─── Patient side ────────────────────────────────────────────
-  window.startPcmCapture = async function (deviceId) {
-    try {
-      if (_pcmCaptureCtx) { await _pcmCaptureCtx.close(); _pcmCaptureCtx = null; }
-
-      var constraints = {
-        audio: {
-          echoCancellation:   { exact: false },
-          noiseSuppression:   { exact: false },
-          autoGainControl:    { exact: false },
-          googHighpassFilter:     false,
-          googNoiseSuppression:   false,
-          googAutoGainControl:    false,
-          googEchoCancellation:   false,
-          sampleRate: 48000,
-        },
-        video: false,
-      };
-      if (deviceId) constraints.audio.deviceId = { exact: deviceId };
-
-      var stream = await navigator.mediaDevices.getUserMedia(constraints);
-      var ctx    = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 48000, latencyHint: 'interactive',
-      });
-      await ctx.resume();
-
-      var blob = new Blob([_pcmWorkletSrc], { type: 'application/javascript' });
-      var blobUrl = URL.createObjectURL(blob);
-      await ctx.audioWorklet.addModule(blobUrl);
-      URL.revokeObjectURL(blobUrl);
-
-      _pcmMicStream = stream;  // เก็บไว้เพื่อ reroute กลับจาก sim
-      var src  = ctx.createMediaStreamSource(stream);
-      var node = new AudioWorkletNode(ctx, 'steth-capture');
-
-      node.port.onmessage = function (e) {
-        if (!_pcmSendEnabled) return; // sender-side mute gate
-        if (_pcmChannel && _pcmChannel.readyState === 'open') {
-          if (!window._pcmSendCount) window._pcmSendCount = 0;
-          window._pcmSendCount++;
-          if (window._pcmSendCount <= 5 || window._pcmSendCount % 500 === 0) {
-            console.log('[PCM] send() #' + window._pcmSendCount + ' state=' + _pcmChannel.readyState + ' bytes=' + e.data.byteLength);
-          }
-          _pcmChannel.send(e.data); // ArrayBuffer Float32LE 960 samples
-        } else if (!_pcmChannel) {
-          console.warn('[PCM] send() skipped — _pcmChannel is null');
-        } else {
-          console.warn('[PCM] send() skipped — readyState=' + (_pcmChannel && _pcmChannel.readyState));
-        }
-      };
-
-      src.connect(node);
-      // Safari requires graph connection to destination — use muted gain to avoid feedback
-      var _muteGain = ctx.createGain();
-      _muteGain.gain.value = 0;
-      node.connect(_muteGain);
-      _muteGain.connect(ctx.destination);
-
-      _pcmCaptureCtx  = ctx;
-      _pcmCaptureNode = node;
-      _pcmSrcNode     = src;
-      // ถ้า peer สั่ง mute มาก่อนที่ capture จะเริ่ม → suspend ctx ทันที (กัน "tab playing audio" + leak)
-      if (_opusMutedState || _pcmMutedState) {
-        ctx.suspend().catch(function(){});
-      }
-      console.log('[PCM] ▶ capture started  deviceId=' + (deviceId || 'default') +
-                  ' ctxState=' + ctx.state);
-    } catch (e) {
-      console.error('[PCM] capture error:', e);
-      throw e;
-    }
-  };
-
-  window.stopPcmCapture = async function () {
-    if (_pcmCaptureNode) { _pcmCaptureNode.disconnect(); _pcmCaptureNode = null; }
-    if (_pcmCaptureCtx)  { await _pcmCaptureCtx.close(); _pcmCaptureCtx  = null; }
-    console.log('[PCM] ■ capture stopped');
-  };
-
-  // ─── Doctor side ─────────────────────────────────────────────
-  var _pcmPlayCtx   = null;
-  var _pcmNextTime  = 0;
-  var _pcmStarted   = false;
-  var _pcmQueue     = [];
-  var _CHUNK_DUR    = 960 / 48000;  // 0.02 s
-  var _JITTER       = 8;            // buffer 8 chunks (160 ms) — absorb network jitter, ลดเสียงแตก
-
-  window.startPcmPlayback = function (dataChannel) {
-    _pcmChannel = dataChannel;
-    _pcmQueue   = [];
-    _pcmStarted = false;
-
-    if (!_pcmPlayCtx || _pcmPlayCtx.state === 'closed') {
-      _pcmPlayCtx = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 48000, latencyHint: 'interactive',
-      });
-      // master gain ก่อน destination — ใช้ gain=0 แทน suspend สำหรับ instant mute
-      _pcmMasterGain = _pcmPlayCtx.createGain();
-      _pcmMasterGain.gain.value = _pcmMutedState ? 0 : 1;
-      _pcmMasterGain.connect(_pcmPlayCtx.destination);
-    }
-    _pcmPlayCtx.resume();
-
-    dataChannel.binaryType = 'arraybuffer';
-    var _pcmMsgCount = 0;
-    dataChannel.addEventListener('message', function (e) {
-      _pcmMsgCount++;
-      if (_pcmMsgCount <= 5 || _pcmMsgCount % 100 === 0) {
-        console.log('[PCM] onmessage #' + _pcmMsgCount + ' bytes=' + e.data.byteLength);
-      }
-      var f32 = new Float32Array(e.data);
-      if (_pcmMsgCount <= 5 || _pcmMsgCount % 100 === 0) {
-        var maxAmp = 0;
-        for (var i = 0; i < f32.length; i++) {
-          var a = Math.abs(f32[i]);
-          if (a > maxAmp) maxAmp = a;
-        }
-        console.log('[PCM] msg#' + _pcmMsgCount + ' maxAmp=' + maxAmp.toFixed(4) +
-                    (maxAmp === 0 ? ' ⚠️ ALL ZEROS' : ' ✅ has signal'));
-      }
-      _pcmQueue.push(f32);
-
-      if (!_pcmStarted && _pcmQueue.length >= _JITTER) {
-        _pcmStarted  = true;
-        _pcmNextTime = _pcmPlayCtx.currentTime + 0.010; // 10 ms warmup
-      }
-
-      if (_pcmStarted) {
-        while (_pcmQueue.length > 0) {
-          var samples = _pcmQueue.shift();
-          var buf = _pcmPlayCtx.createBuffer(1, samples.length, 48000);
-          buf.getChannelData(0).set(samples);
-          var src = _pcmPlayCtx.createBufferSource();
-          src.buffer = buf;
-          src.connect(_pcmMasterGain || _pcmPlayCtx.destination);
-          var t = Math.max(_pcmNextTime, _pcmPlayCtx.currentTime);
-          src.start(t);
-          _pcmNextTime = t + _CHUNK_DUR;
-        }
-      }
-    });
-    dataChannel.onclose = function () {
-      console.log('[PCM] DataChannel closed — playback ended');
-      _pcmStarted = false; _pcmQueue = [];
-    };
-    console.log('[PCM] ▶ playback ready — waiting for chunks...');
-  };
-
-  window.stopPcmPlayback = function () {
-    if (_pcmPlayCtx) { _pcmPlayCtx.close().catch(function(){}); _pcmPlayCtx = null; }
-    _pcmQueue   = [];
-    _pcmStarted = false;
-    console.log('[PCM] ■ playback stopped');
-  };
-
-  // ปิด/เปิด Opus output ครบทุก path บน web (deterministic ผ่าน Web Audio masterGain)
-  window.setRemoteAudioMuted = function (muted) {
-    _opusMutedState = muted;
-    var count = 0;
-    // 1. WebRTC receiver tracks (defense in depth)
-    for (var pc of _uniquePcs()) {
-      for (var receiver of pc.getReceivers()) {
-        if (receiver.track && receiver.track.kind === 'audio') {
-          receiver.track.enabled = !muted;
-          count++;
-        }
-      }
-    }
-    // 2. <audio>/<video> direct mute — บังคับ ALL elements (กัน flutter_webrtc reset)
-    //    ไม่ว่าจะมี sink หรือ bass filter หรือไม่ ก็ set el.muted ตาม mute state เสมอ
-    //    ถ้ามี sink/bass: ก็ยังต้อง muted=true (route ผ่าน WebAudio) — set ไม่ผิด
-    //    ถ้าไม่มี sink/bass: ต้องการ muted=true ตอนปิดเสียง
-    //    เมื่อ unmute: ถ้ามี sink/bass ต้องคง muted=true (เพราะ output ผ่าน WebAudio)
-    //                 ถ้าไม่มี ต้อง muted=false ให้ element เล่นออก speaker
-    var elements = _getRemoteMediaElements();
-    elements.forEach(function (el) {
-      if (!el.srcObject) return;
-      if (_audioSink.has(el) || _bassFilters.has(el)) {
-        el.muted = true;       // route ผ่าน WebAudio เท่านั้น — เก็บ muted=true เสมอ
-        el.volume = muted ? 0 : 1;
-      } else {
-        el.muted  = muted;
-        el.volume = muted ? 0 : 1;
-      }
-    });
-    // 3. Always-on audio sink — disconnect + SUSPEND ctx เลย กัน Chrome แสดง "tab playing"
-    _audioSink.forEach(function (s) {
-      if (!s.masterGain || !s.ctx) return;
-      s.masterGain.gain.value = muted ? 0 : 1;
-      try {
-        if (muted) {
-          s.masterGain.disconnect();
-          s.ctx.suspend().catch(function(){});
-        } else {
-          s.masterGain.connect(s.ctx.destination);
-          s.ctx.resume().catch(function(){});
-        }
-      } catch (e) { /* already (dis)connected */ }
-    });
-    // 4. Bass boost — disconnect + SUSPEND ctx
-    _bassFilters.forEach(function (f) {
-      if (!f.masterGain || !f.ctx) return;
-      f.masterGain.gain.value = muted ? 0 : 1;
-      try {
-        if (muted) {
-          f.masterGain.disconnect();
-          f.ctx.suspend().catch(function(){});
-        } else {
-          f.masterGain.connect(f.ctx.destination);
-          f.ctx.resume().catch(function(){});
-        }
-      } catch (e) { /* already (dis)connected */ }
-    });
-    // 5. Reference compare audio (doctor's heart sound reference player)
-    //    _refAudio เป็น HTMLAudioElement ที่เล่นออก speaker โดยตรง — ต้อง mute ด้วย
-    if (_refAudio) {
-      _refAudio.muted = muted;
-      _refAudio.volume = muted ? 0 : 1;
-    }
-    // 6. NUCLEAR: el.srcObject = null กัน flutter_webrtc internal render path
-    //    (el.muted=true + sink masterGain disconnect บางที Chrome ยัง render)
-    //    เก็บ stream ไว้ใน _savedSrcObjects เพื่อ restore ตอน unmute
-    elements.forEach(function (el) {
-      if (muted) {
-        if (el.srcObject) {
-          _savedSrcObjects.set(el, el.srcObject);
-          try { el.srcObject = null; } catch (e) {}
-        }
-      } else {
-        var saved = _savedSrcObjects.get(el);
-        if (saved && !el.srcObject) {
-          try { el.srcObject = saved; el.play().catch(function(){}); } catch (e) {}
-        }
-        _savedSrcObjects.delete(el);
-      }
-    });
-    console.log('[Opus] muted=' + muted + ' tracks=' + count +
-                ' sinks=' + _audioSink.size + ' bass=' + _bassFilters.size +
-                ' elements=' + elements.length +
-                ' ref=' + (_refAudio ? (_refAudio.muted ? 'muted' : 'live') : 'none') +
-                ' savedSrc=' + _savedSrcObjects.size);
-    window._debugAudioElements();  // เรียกทุกครั้ง — เพื่อ trace audio rendering path
-    window._diagnoseContexts();
-  };
-
-  // Diagnostic: แสดง state ของทุก AudioContext เพื่อยืนยันว่า suspend จริง
-  window._diagnoseContexts = function() {
-    var report = [];
-    if (_pcmPlayCtx) report.push('pcmPlay=' + _pcmPlayCtx.state);
-    if (_pcmCaptureCtx) report.push('pcmCapture=' + _pcmCaptureCtx.state);
-    if (_simCtx) report.push('sim=' + _simCtx.state);
-    var sinkIdx = 0;
-    _audioSink.forEach(function(s) {
-      if (s.ctx) report.push('sink#' + sinkIdx + '=' + s.ctx.state);
-      sinkIdx++;
-    });
-    var bassIdx = 0;
-    _bassFilters.forEach(function(f) {
-      if (f.ctx) report.push('bass#' + bassIdx + '=' + f.ctx.state);
-      bassIdx++;
-    });
-    console.log('[CtxState]', report.join(' '));
-  };
-
-  // PCM mute — nuclear: disconnect + SUSPEND ctx เลย
-  // กัน buffer source ใดๆ ที่ connect เข้า masterGain + กัน Chrome แสดง "tab playing audio"
-  window.setPcmPlaybackMuted = function (muted) {
-    _pcmMutedState = muted;
-    if (_pcmMasterGain && _pcmPlayCtx) {
-      _pcmMasterGain.gain.value = muted ? 0 : 1;
-      try {
-        if (muted) {
-          _pcmMasterGain.disconnect();
-          _pcmPlayCtx.suspend().catch(function(){});
-        } else {
-          _pcmMasterGain.connect(_pcmPlayCtx.destination);
-          _pcmPlayCtx.resume().catch(function(){});
-        }
-      } catch (e) { /* already (dis)connected */ }
-    }
-    // Patient side — suspend PCM capture ctx + sim ctx ด้วย (ฝั่ง patient ไม่มี _pcmPlayCtx)
-    try {
-      if (_pcmCaptureCtx) {
-        if (muted) _pcmCaptureCtx.suspend().catch(function(){});
-        else _pcmCaptureCtx.resume().catch(function(){});
-      }
-      if (_simCtx) {
-        if (muted) _simCtx.suspend().catch(function(){});
-        else _simCtx.resume().catch(function(){});
-      }
-    } catch (e) {}
-    console.log('[PCM] playback ' + (muted ? 'muted (disconnected+suspended)' : 'unmuted (connected+resumed)'));
-  };
-
-  // ─── Single RTCPeerConnection patch: track _pcs + intercept DataChannel ──────
-  // ห้าม patch 2 ครั้ง — ทุก PC จะถูก push เข้า _pcs ซ้ำ
+  // Single PatchedPC — track PCs + intercept DataChannels
   (function () {
     var _OrigPC = window.RTCPeerConnection;
     function PatchedPC(config) {
       var pc = new _OrigPC(config);
-      // Track PC ใน _pcs เพื่อให้ startJsRecording / SimAudio inject หา sender ได้
-      window._pcs = window._pcs || [];
       window._pcs.push(pc);
-      // Cleanup 2 layers: ทั้ง close() override + connectionstatechange
       var origClose = pc.close.bind(pc);
       pc.close = function () {
         window._pcs = window._pcs.filter(function (p) { return p !== pc; });
@@ -864,25 +68,22 @@
           window._pcs = window._pcs.filter(function (p) { return p !== pc; });
         }
       });
-      // Patient side — intercept createDataChannel
+      // Patient — intercept PCM DC creation (Dart calls createDataChannel)
       var _origCreate = pc.createDataChannel.bind(pc);
       pc.createDataChannel = function (label, opts) {
         var dc = _origCreate(label, opts);
         if (label === 'pcm-heart') {
-          _pcmChannel = dc;
-          console.log('[PCM] _pcmChannel set label=' + dc.label + ' readyState=' + dc.readyState);
-          dc.onopen  = function () { console.log('[PCM] ✅ DataChannel OPEN (patient can send)'); };
-          dc.onerror = function (e) { console.error('[PCM] ❌ DataChannel ERROR:', e); };
-          dc.onclose = function () { console.warn('[PCM] ⚠️ DataChannel CLOSED (patient)'); };
+          _pcmSendChannel = dc;
+          console.log('[PCM] sender channel ready');
         }
         return dc;
       };
-      // Doctor side — addEventListener ไม่โดน Flutter Dart ทับ (property assignment โดนทับ)
+      // Doctor — intercept PCM DC reception
       pc.addEventListener('datachannel', function (event) {
         var dc = event.channel;
         if (dc.label === 'pcm-heart') {
-          console.log('[PCM] ✅ ondatachannel fired! label=' + dc.label + ' readyState=' + dc.readyState);
-          window.startPcmPlayback(dc);
+          console.log('[PCM] receiver channel ready');
+          window._startPcmPlayback(dc);
         }
       });
       return pc;
@@ -893,10 +94,432 @@
   })();
 
   // ============================================================
-  // 4. iOS Safari audio unlock
+  // Opus playback (voice) — Web Audio sink for <audio> elements
+  //   Mute: masterGain.disconnect() + ctx.suspend()
+  // ============================================================
+  var _opusMuted = false;
+  var _audioSink = new Map(); // <audio> el → { ctx, masterGain }
+
+  function _getAudioEls() {
+    return Array.from(document.querySelectorAll('audio'));
+  }
+
+  function _attachSink(el) {
+    if (_audioSink.has(el)) return;
+    if (!el.srcObject || el.srcObject.getAudioTracks().length === 0) return;
+    try {
+      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      var src = ctx.createMediaStreamSource(el.srcObject);
+      var masterGain = ctx.createGain();
+      masterGain.gain.value = _opusMuted ? 0 : 1;
+      src.connect(masterGain);
+      // ไม่ suspend ctx (กัน Chrome reinit audio device) — ใช้แค่ disconnect masterGain
+      if (!_opusMuted) {
+        masterGain.connect(ctx.destination);
+      }
+      ctx.resume().catch(function(){});
+      // Triple layer mute on element: muted=true + volume=0 — direct element output silent
+      el.muted = true;
+      el.volume = 0;
+      _audioSink.set(el, { ctx: ctx, masterGain: masterGain });
+    } catch (e) {
+      console.error('[Sink] attach error:', e);
+    }
+  }
+
+  function _detachSink(el) {
+    var s = _audioSink.get(el);
+    if (!s) return;
+    try { s.ctx.close().catch(function(){}); } catch(e) {}
+    _audioSink.delete(el);
+  }
+
+  setInterval(function () {
+    _getAudioEls().forEach(function (el) {
+      if (el.srcObject && el.srcObject.getAudioTracks().length > 0) {
+        _attachSink(el);
+      } else if (_audioSink.has(el)) {
+        _detachSink(el);
+      }
+      // Re-enforce muted=true + volume=0 ทุก 800ms กัน flutter_webrtc reset
+      if (_audioSink.has(el)) {
+        if (el.muted !== true) el.muted = true;
+        if (el.volume !== 0) el.volume = 0;
+      }
+    });
+  }, 800);
+
+  // Mute via gain + disconnect — ไม่ suspend ctx เพราะ Chrome จะ reinit audio device
+  //   ทำให้ mic capture สะดุด (เคยทำให้ "พูดไม่ได้")
+  window.setOpusMuted = function (muted) {
+    _opusMuted = muted;
+    _audioSink.forEach(function (s) {
+      if (!s.masterGain || !s.ctx) return;
+      s.masterGain.gain.value = muted ? 0 : 1;
+      try {
+        if (muted) {
+          s.masterGain.disconnect();
+        } else {
+          s.masterGain.connect(s.ctx.destination);
+        }
+      } catch(e) {}
+    });
+    console.log('[Opus] muted=' + muted + ' sinks=' + _audioSink.size);
+  };
+
+  // ============================================================
+  // SimAudio — Heart sound transmission (PCM DataChannel only)
+  //   Single AudioContext: BufferSource → AudioWorklet → DataChannel
+  //   No MediaStreamDestination, no replaceTrack, no duplicate getUserMedia
+  // ============================================================
+  var _simCtx = null;
+  var _simSrc = null;
+  var _simBufferCache = {}; // url → AudioBuffer (decoded once)
+  var _pcmSendChannel = null;
+
+  var _pcmWorkletSrc = [
+    "class StethCapture extends AudioWorkletProcessor {",
+    "  constructor() { super(); this._buf = new Float32Array(1920); this._pos = 0; }",
+    "  process(inputs) {",
+    "    var ch = inputs[0] && inputs[0][0];",
+    "    if (!ch) return true;",
+    "    for (var i = 0; i < ch.length; i++) {",
+    "      this._buf[this._pos++] = ch[i];",
+    "      if (this._pos === 1920) {",   // 40ms @ 48kHz
+    "        this.port.postMessage(this._buf.buffer, [this._buf.buffer]);",
+    "        this._buf = new Float32Array(1920); this._pos = 0;",
+    "      }",
+    "    }",
+    "    return true;",
+    "  }",
+    "}",
+    "registerProcessor('steth-capture', StethCapture);"
+  ].join('\n');
+
+  // Quantize Float32 [-1,1] → Int16 LE → 768 kbps (half of Float32)
+  function _floatToInt16(f32) {
+    var i16 = new Int16Array(f32.length);
+    for (var i = 0; i < f32.length; i++) {
+      var s = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return i16;
+  }
+
+  window.startSimAudio = async function (assetPath) {
+    try {
+      // Stop previous if any
+      if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc = null; }
+      if (_simCtx) { try { await _simCtx.close(); } catch(_){} _simCtx = null; }
+
+      var ctx = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 48000, latencyHint: 'interactive',
+      });
+      await ctx.resume();
+
+      // Load worklet
+      var blob = new Blob([_pcmWorkletSrc], { type: 'application/javascript' });
+      var blobUrl = URL.createObjectURL(blob);
+      await ctx.audioWorklet.addModule(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+
+      // Decode + cache
+      var url = new URL(assetPath, window.location.href).href;
+      var audioBuffer = _simBufferCache[url];
+      if (!audioBuffer) {
+        var resp = await fetch(url);
+        if (!resp.ok) throw new Error('Fetch failed: ' + resp.status + ' ' + url);
+        var arr = await resp.arrayBuffer();
+        audioBuffer = await ctx.decodeAudioData(arr);
+        _simBufferCache[url] = audioBuffer;
+      }
+
+      // BufferSource → AudioWorklet → muted gain → destination
+      // (worklet doesn't write outputs[] so destination output is silent)
+      var src = ctx.createBufferSource();
+      src.buffer = audioBuffer;
+      src.loop = true;
+
+      var pcmNode = new AudioWorkletNode(ctx, 'steth-capture');
+      var _sendCount = 0;
+      pcmNode.port.onmessage = function (e) {
+        if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
+        var f32 = new Float32Array(e.data);
+        var i16 = _floatToInt16(f32);
+        try {
+          _pcmSendChannel.send(i16.buffer);
+          _sendCount++;
+          if (_sendCount === 1 || _sendCount % 500 === 0) {
+            console.log('[PCM] send #' + _sendCount);
+          }
+        } catch (err) {
+          console.error('[PCM] send error:', err);
+        }
+      };
+
+      src.connect(pcmNode);
+      // Safari requires graph→destination — use muted gain (no speaker leak)
+      var muteGain = ctx.createGain();
+      muteGain.gain.value = 0;
+      pcmNode.connect(muteGain);
+      muteGain.connect(ctx.destination);
+
+      src.start();
+      _simCtx = ctx;
+      _simSrc = src;
+      console.log('[SimAudio] started ' + assetPath);
+    } catch (e) {
+      console.error('[SimAudio] error:', e);
+    }
+  };
+
+  window.stopSimAudio = async function () {
+    try {
+      if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc = null; }
+      if (_simCtx) { try { await _simCtx.close(); } catch(_){} _simCtx = null; }
+      console.log('[SimAudio] stopped');
+    } catch (e) {
+      console.error('[SimAudio] stop error:', e);
+    }
+  };
+
+  // ============================================================
+  // Live stethoscope mic — separate getUserMedia with filters OFF
+  //   For real stethoscope held to mic — preserve low bass (20-200Hz)
+  //   AEC/NS/AGC = exact:false → raw signal
+  // ============================================================
+  var _stethCtx = null;
+  var _stethStream = null;
+
+  window.startStethMic = async function () {
+    try {
+      // Stop any previous live mic
+      if (_stethCtx) await window.stopStethMic();
+
+      var stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: { exact: false },
+          noiseSuppression: { exact: false },
+          autoGainControl: { exact: false },
+          googHighpassFilter: false,
+          googNoiseSuppression: false,
+          googAutoGainControl: false,
+          googEchoCancellation: false,
+          sampleRate: 48000,
+          channelCount: 1,
+        },
+        video: false,
+      });
+
+      var ctx = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 48000, latencyHint: 'interactive',
+      });
+      await ctx.resume();
+
+      var blob = new Blob([_pcmWorkletSrc], { type: 'application/javascript' });
+      var blobUrl = URL.createObjectURL(blob);
+      await ctx.audioWorklet.addModule(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+
+      var src = ctx.createMediaStreamSource(stream);
+      var pcmNode = new AudioWorkletNode(ctx, 'steth-capture');
+      var _sendCount = 0;
+      pcmNode.port.onmessage = function (e) {
+        if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
+        var f32 = new Float32Array(e.data);
+        var i16 = _floatToInt16(f32);
+        try {
+          _pcmSendChannel.send(i16.buffer);
+          _sendCount++;
+          if (_sendCount === 1 || _sendCount % 500 === 0) {
+            console.log('[StethMic] send #' + _sendCount);
+          }
+        } catch (err) {
+          console.error('[StethMic] send error:', err);
+        }
+      };
+
+      src.connect(pcmNode);
+      var muteGain = ctx.createGain();
+      muteGain.gain.value = 0;
+      pcmNode.connect(muteGain);
+      muteGain.connect(ctx.destination);
+
+      _stethCtx = ctx;
+      _stethStream = stream;
+      console.log('[StethMic] started (filters OFF, 48kHz)');
+    } catch (e) {
+      console.error('[StethMic] error:', e);
+      throw e;
+    }
+  };
+
+  window.stopStethMic = async function () {
+    try {
+      if (_stethCtx) { try { await _stethCtx.close(); } catch(_){} _stethCtx = null; }
+      if (_stethStream) {
+        _stethStream.getTracks().forEach(function (t) { t.stop(); });
+        _stethStream = null;
+      }
+      console.log('[StethMic] stopped');
+    } catch (e) {
+      console.error('[StethMic] stop error:', e);
+    }
+  };
+
+  // ============================================================
+  // PCM Playback (Doctor) — DataChannel → BufferSource scheduled
+  //   Jitter buffer: 4 chunks × 40ms = 160ms
+  //   Bass boost: lowshelf +6dB @ 200Hz (display aid, toggleable)
+  // ============================================================
+  var _pcmPlayCtx = null;
+  var _pcmMasterGain = null;
+  var _pcmBassFilter = null;
+  var _pcmMuted = false;
+  var _bassBoostEnabled = false;
+  var _pcmQueue = [];
+  var _pcmStarted = false;
+  var _pcmNextTime = 0;
+  var _CHUNK_DUR = 1920 / 48000;
+  var _JITTER = 4;
+
+  window._startPcmPlayback = function (dc) {
+    if (!_pcmPlayCtx || _pcmPlayCtx.state === 'closed') {
+      _pcmPlayCtx = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 48000, latencyHint: 'interactive',
+      });
+      _pcmMasterGain = _pcmPlayCtx.createGain();
+      _pcmMasterGain.gain.value = _pcmMuted ? 0 : 1;
+      _pcmBassFilter = _pcmPlayCtx.createBiquadFilter();
+      _pcmBassFilter.type = 'lowshelf';
+      _pcmBassFilter.frequency.value = 200;
+      _pcmBassFilter.gain.value = _bassBoostEnabled ? 6 : 0;
+      _pcmBassFilter.connect(_pcmMasterGain);
+      if (!_pcmMuted) _pcmMasterGain.connect(_pcmPlayCtx.destination);
+    }
+    if (_pcmPlayCtx.state === 'suspended' && !_pcmMuted) _pcmPlayCtx.resume();
+
+    dc.binaryType = 'arraybuffer';
+    var _msgCount = 0;
+    dc.addEventListener('message', function (e) {
+      _msgCount++;
+      if (_msgCount === 1 || _msgCount % 500 === 0) console.log('[PCM] recv #' + _msgCount);
+
+      var i16 = new Int16Array(e.data);
+      var f32 = new Float32Array(i16.length);
+      for (var i = 0; i < i16.length; i++) {
+        f32[i] = i16[i] < 0 ? i16[i] / 0x8000 : i16[i] / 0x7FFF;
+      }
+      _pcmQueue.push(f32);
+
+      if (!_pcmStarted && _pcmQueue.length >= _JITTER) {
+        _pcmStarted = true;
+        _pcmNextTime = _pcmPlayCtx.currentTime + 0.010;
+      }
+      if (_pcmStarted) {
+        while (_pcmQueue.length > 0) {
+          var samples = _pcmQueue.shift();
+          var buf = _pcmPlayCtx.createBuffer(1, samples.length, 48000);
+          buf.getChannelData(0).set(samples);
+          var src = _pcmPlayCtx.createBufferSource();
+          src.buffer = buf;
+          src.connect(_pcmBassFilter);
+          var t = Math.max(_pcmNextTime, _pcmPlayCtx.currentTime);
+          src.start(t);
+          _pcmNextTime = t + _CHUNK_DUR;
+        }
+      }
+    });
+    dc.addEventListener('close', function () {
+      _pcmStarted = false;
+      _pcmQueue = [];
+    });
+  };
+
+  window.setPcmMuted = function (muted) {
+    _pcmMuted = muted;
+    if (!_pcmMasterGain || !_pcmPlayCtx) return;
+    _pcmMasterGain.gain.value = muted ? 0 : 1;
+    try {
+      if (muted) {
+        _pcmMasterGain.disconnect();
+      } else {
+        _pcmMasterGain.connect(_pcmPlayCtx.destination);
+        _pcmPlayCtx.resume().catch(function(){});
+      }
+    } catch(e) {}
+    console.log('[PCM] muted=' + muted);
+  };
+
+  window.setBassBoost = function (enabled) {
+    _bassBoostEnabled = enabled;
+    if (_pcmBassFilter) _pcmBassFilter.gain.value = enabled ? 6 : 0;
+    console.log('[Bass] enabled=' + enabled);
+  };
+
+  // ============================================================
+  // Recording — MediaRecorder บน remote audio (Doctor side)
+  //   capture เสียงทุก channel ที่ doctor ฟังอยู่ (ทั้ง Opus + อาจรวม PCM
+  //   ผ่าน Web Audio destination — แต่ MediaRecorder บน MediaStream ของ
+  //   receiver จะได้เฉพาะ Opus track ของ patient).
+  //   Return: blob URL (memory only — refresh เพจแล้วหาย)
+  // ============================================================
+  var _mediaRecorder = null;
+  var _recChunks = [];
+
+  window.startRecording = async function () {
+    try {
+      if (_mediaRecorder) { try { _mediaRecorder.stop(); } catch(_){} }
+      // Collect all remote audio tracks (heart sound carried via PCM DC ไม่อยู่ใน MediaStream
+      //  — แต่เสียง Opus จาก patient ใช้ได้สำหรับ voice; ส่วน heart sound ผ่าน PCM
+      //  ต้องบันทึกฝั่ง doctor ผ่าน _pcmPlayCtx destination แยก — phase นี้บันทึก Opus ก่อน)
+      var stream = new MediaStream();
+      _uniquePcs().forEach(function (pc) {
+        pc.getReceivers().forEach(function (r) {
+          if (r.track && r.track.kind === 'audio') stream.addTrack(r.track);
+        });
+      });
+      if (stream.getAudioTracks().length === 0) {
+        throw new Error('ไม่พบเสียงสำหรับบันทึก');
+      }
+      var mime = 'audio/webm;codecs=opus';
+      if (!MediaRecorder.isTypeSupported(mime)) mime = 'audio/webm';
+      _recChunks = [];
+      _mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+      _mediaRecorder.ondataavailable = function (e) {
+        if (e.data && e.data.size > 0) _recChunks.push(e.data);
+      };
+      _mediaRecorder.start(250); // chunk every 250ms
+      console.log('[Rec] started mime=' + mime);
+    } catch (e) {
+      console.error('[Rec] start error:', e);
+      throw e;
+    }
+  };
+
+  window.stopRecording = function () {
+    return new Promise(function (resolve, reject) {
+      if (!_mediaRecorder) { resolve(''); return; }
+      _mediaRecorder.onstop = function () {
+        try {
+          var blob = new Blob(_recChunks, { type: _mediaRecorder.mimeType });
+          var url = URL.createObjectURL(blob);
+          _recChunks = [];
+          _mediaRecorder = null;
+          console.log('[Rec] stopped, blob size=' + blob.size);
+          resolve(url);
+        } catch (e) {
+          reject(e);
+        }
+      };
+      try { _mediaRecorder.stop(); } catch (e) { reject(e); }
+    });
+  };
+
+  // ============================================================
+  // iOS audio unlock — required user gesture
   // ============================================================
   var _audioUnlocked = false;
-
   function unlockAudio() {
     if (_audioUnlocked) return;
     _audioUnlocked = true;
@@ -904,9 +527,8 @@
       var Ctx = window.AudioContext || window.webkitAudioContext;
       if (Ctx) new Ctx().resume();
     } catch(e) {}
-    _getRemoteMediaElements().forEach(function (el) {
-      // ห้าม unmute element ที่ route ผ่าน Web Audio sink — เสียงออกจาก context อยู่แล้ว
-      if (!_audioSink.has(el) && !_bassFilters.has(el)) el.muted = false;
+    _getAudioEls().forEach(function (el) {
+      if (!_audioSink.has(el)) el.muted = false;
       el.play().catch(function(){});
     });
     var el = document.getElementById('audio-unlock-overlay');
@@ -926,13 +548,12 @@
   document.addEventListener('touchstart', unlockAudio, { passive: true });
   document.addEventListener('click', unlockAudio);
 
-  var _vidObserver = new MutationObserver(function () {
+  new MutationObserver(function () {
     if (!_audioUnlocked) return;
-    _getRemoteMediaElements().forEach(function (el) {
+    _getAudioEls().forEach(function (el) {
       if (el.srcObject && el.paused) el.play().catch(function(){});
     });
-  });
-  _vidObserver.observe(document.body, { childList: true, subtree: true, attributes: true });
+  }).observe(document.body, { childList: true, subtree: true, attributes: true });
   </script>
 
   <script src="flutter_bootstrap.js" async></script>
