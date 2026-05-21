@@ -177,17 +177,19 @@
   var _simBufferCache = {}; // url → AudioBuffer (decoded once)
   var _pcmSendChannel = null;
 
+  // 40ms chunks @ 16kHz = 640 samples → 1280 bytes/chunk (Int16) = 256 kbps
+  // ลด bandwidth จาก 768 kbps (48kHz) → 256 kbps (16kHz) สำหรับ 4G friendly
   var _pcmWorkletSrc = [
     "class StethCapture extends AudioWorkletProcessor {",
-    "  constructor() { super(); this._buf = new Float32Array(1920); this._pos = 0; }",
+    "  constructor() { super(); this._buf = new Float32Array(640); this._pos = 0; }",
     "  process(inputs) {",
     "    var ch = inputs[0] && inputs[0][0];",
     "    if (!ch) return true;",
     "    for (var i = 0; i < ch.length; i++) {",
     "      this._buf[this._pos++] = ch[i];",
-    "      if (this._pos === 1920) {",   // 40ms @ 48kHz
+    "      if (this._pos === 640) {",   // 40ms @ 16kHz
     "        this.port.postMessage(this._buf.buffer, [this._buf.buffer]);",
-    "        this._buf = new Float32Array(1920); this._pos = 0;",
+    "        this._buf = new Float32Array(640); this._pos = 0;",
     "      }",
     "    }",
     "    return true;",
@@ -212,8 +214,10 @@
       if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc = null; }
       if (_simCtx) { try { await _simCtx.close(); } catch(_){} _simCtx = null; }
 
+      // 16kHz — sufficient for heart sound (S1/S2 fundamentals < 200Hz, harmonics < 2kHz)
+      // Browser auto-resamples WAV asset (48k) → 16k with high-quality anti-aliasing filter
       var ctx = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 48000, latencyHint: 'interactive',
+        sampleRate: 16000, latencyHint: 'interactive',
       });
       await ctx.resume();
 
@@ -305,14 +309,15 @@
           googNoiseSuppression: false,
           googAutoGainControl: false,
           googEchoCancellation: false,
-          sampleRate: 48000,
+          sampleRate: 16000,
           channelCount: 1,
         },
         video: false,
       });
 
+      // 16kHz ctx — ถ้า mic ให้ 48k มา browser resample ลง 16k ให้ auto
       var ctx = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 48000, latencyHint: 'interactive',
+        sampleRate: 16000, latencyHint: 'interactive',
       });
       await ctx.resume();
 
@@ -380,13 +385,13 @@
   var _pcmQueue = [];
   var _pcmStarted = false;
   var _pcmNextTime = 0;
-  var _CHUNK_DUR = 1920 / 48000;
-  var _JITTER = 4;
+  var _CHUNK_DUR = 640 / 16000;  // 40ms — same duration, 16kHz rate
+  var _JITTER = 8;               // 8 chunks × 40ms = 320ms buffer (was 160ms) — 4G friendly
 
   window._startPcmPlayback = function (dc) {
     if (!_pcmPlayCtx || _pcmPlayCtx.state === 'closed') {
       _pcmPlayCtx = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 48000, latencyHint: 'interactive',
+        sampleRate: 16000, latencyHint: 'interactive',
       });
       _pcmMasterGain = _pcmPlayCtx.createGain();
       _pcmMasterGain.gain.value = _pcmMuted ? 0 : 1;
@@ -419,7 +424,7 @@
       if (_pcmStarted) {
         while (_pcmQueue.length > 0) {
           var samples = _pcmQueue.shift();
-          var buf = _pcmPlayCtx.createBuffer(1, samples.length, 48000);
+          var buf = _pcmPlayCtx.createBuffer(1, samples.length, 16000);
           buf.getChannelData(0).set(samples);
           var src = _pcmPlayCtx.createBufferSource();
           src.buffer = buf;
