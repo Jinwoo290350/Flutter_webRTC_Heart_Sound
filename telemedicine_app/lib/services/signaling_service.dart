@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -37,23 +38,33 @@ class SignalingService {
 
   // ==================== Patient (Caller) ====================
 
-  /// สร้าง room ใหม่ใน Firestore และอัปโหลด offer SDP
-  /// คืนค่า roomId ที่ patient จะแชร์ให้ doctor
+  /// สร้าง room ใหม่ใน Firestore — ใช้ 6-digit numeric code (อ่านง่าย พิมพ์ง่ายบนมือถือ)
+  /// คืนค่า roomId (6 หลัก) ที่ patient จะแชร์ให้ doctor
   Future<String> createRoom(RTCSessionDescription offer) async {
-    // สร้าง document ใหม่ใน collection 'rooms' (auto-ID)
-    _roomRef = _firestore.collection(FirebaseConfig.roomsCollection).doc();
-    _roomId = _roomRef!.id;
-
-    await _roomRef!.set({
-      FirebaseConfig.offerField: {
-        'type': offer.type,
-        'sdp': offer.sdp,
-      },
-      FirebaseConfig.statusField: FirebaseConfig.statusWaiting,
-      FirebaseConfig.createdAtField: FieldValue.serverTimestamp(),
-    });
-
-    return _roomId!;
+    final rng = Random.secure();
+    Exception? lastError;
+    for (int attempt = 0; attempt < 5; attempt++) {
+      final code = (100000 + rng.nextInt(900000)).toString(); // 100000-999999
+      final docRef = _firestore.collection(FirebaseConfig.roomsCollection).doc(code);
+      try {
+        final snap = await docRef.get();
+        if (snap.exists) continue; // collision — try another code
+        _roomRef = docRef;
+        _roomId = code;
+        await _roomRef!.set({
+          FirebaseConfig.offerField: {
+            'type': offer.type,
+            'sdp': offer.sdp,
+          },
+          FirebaseConfig.statusField: FirebaseConfig.statusWaiting,
+          FirebaseConfig.createdAtField: FieldValue.serverTimestamp(),
+        });
+        return code;
+      } catch (e) {
+        lastError = Exception('createRoom error: $e');
+      }
+    }
+    throw lastError ?? Exception('ไม่สามารถสร้าง room code ได้ — ลองอีกครั้ง');
   }
 
   /// Patient รอฟัง answer จาก doctor

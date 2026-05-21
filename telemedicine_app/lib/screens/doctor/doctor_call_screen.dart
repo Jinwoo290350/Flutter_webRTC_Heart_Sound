@@ -56,7 +56,8 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
 
   Future<void> _join() async {
     final webrtc = context.read<WebRTCService>();
-    final id = _roomCtrl.text.trim();
+    // strip spaces/dashes — user อาจกรอก "123 456" หรือ "123-456"
+    final id = _roomCtrl.text.replaceAll(RegExp(r'[\s-]'), '').trim();
     if (id.isEmpty) return;
     await webrtc.joinCall(id);
   }
@@ -221,12 +222,24 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                       children: [
                         TextField(
                           controller: _roomCtrl,
+                          keyboardType: TextInputType.number,
+                          textAlign: TextAlign.center,
+                          maxLength: 7, // 6 digits + 1 space "XXX XXX"
+                          style: const TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 4,
+                            fontFamily: 'monospace',
+                          ),
                           decoration: const InputDecoration(
-                            labelText: 'Room ID',
+                            labelText: 'รหัสห้อง (6 หลัก)',
+                            hintText: '123 456',
                             border: OutlineInputBorder(),
                             fillColor: Colors.white,
                             filled: true,
+                            counterText: '',
                           ),
+                          onSubmitted: (_) => _join(),
                         ),
                         const SizedBox(height: 16),
                         ElevatedButton.icon(

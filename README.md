@@ -79,6 +79,46 @@ cd telemedicine_app
 
 Same machine 2 tabs จะมี acoustic loop: speaker → mic → speaker. กด 🎤 ฝั่งใดฝั่งหนึ่งตัด echo
 
+### Cross-device testing (Mac + Mobile) ผ่าน Cloudflare Tunnel
+
+ทดสอบจริงต้องใช้ 2 device คนละ network (เช่น Mac WiFi + มือถือ 4G) — expose `localhost:8080` ผ่าน tunnel:
+
+```bash
+# Install (one-time)
+brew install cloudflared
+
+# Terminal 1: Flutter web server
+cd telemedicine_app
+./start_test_server.sh build
+
+# Terminal 2: tunnel
+cloudflared tunnel --url http://localhost:8080
+```
+
+ได้ output แบบ:
+```
++----------------------------------------------------+
+| https://random-words.trycloudflare.com             |
++----------------------------------------------------+
+```
+
+**บน Mac:** เปิด `localhost:8080` (เร็วกว่า) → เลือก "แพทย์"
+**บนมือถือ:** เปิด `https://random-words.trycloudflare.com` ใน Chrome/Safari → เลือก "คนไข้" → "เริ่มการโทร" → ขอ permission camera + mic → ดูรหัสห้อง 6 หลัก
+**Mac กรอกรหัส 6 หลัก** → เข้าร่วม → call connects (ICE ผ่าน TURN ถ้า P2P fail)
+
+**ข้อสำคัญ:**
+- Cloudflare auto HTTPS → `getUserMedia` ทำงานบนมือถือ (HTTP จะ block)
+- WebRTC P2P หลัง signaling — data ไม่ผ่าน Cloudflare (low latency)
+- Tunnel URL random ทุกครั้ง — Ctrl+C ปิด URL หาย
+- Firebase Firestore ทำงานทุก origin (project ไม่ใช้ Auth)
+
+### Room code (6-digit numeric)
+
+Patient เริ่มโทร → ระบบ generate รหัสห้อง 6 หลัก (เช่น `123 456`) ที่ doctor ใช้เข้าร่วม
+- Numeric keyboard บนมือถือ
+- Doctor กรอก `123456` หรือ `123 456` ก็ได้ (space ถูก strip auto)
+- 1 ล้าน combinations + collision retry (5 attempts) → safe จนกว่า rooms > 10k active
+
 ---
 
 ## Project Structure

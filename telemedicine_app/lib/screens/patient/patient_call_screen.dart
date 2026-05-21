@@ -120,6 +120,12 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
     }
   }
 
+  /// 6-digit code → "XXX XXX" (อ่านง่ายขึ้น)
+  String _formatRoomCode(String id) {
+    if (id.length == 6) return '${id.substring(0, 3)} ${id.substring(3)}';
+    return id;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Consumer<WebRTCService>(
@@ -178,21 +184,37 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
                           child: GestureDetector(
                             onTap: () => _copyRoom(roomId),
                             child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
                               decoration: BoxDecoration(
                                 color: Colors.black87,
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(color: Colors.white24),
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(color: Colors.white24, width: 1.5),
                               ),
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  Text(
-                                    'Room ID: $roomId',
-                                    style: const TextStyle(color: Colors.white, fontSize: 16),
+                                  Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Text(
+                                        'รหัสห้อง',
+                                        style: TextStyle(color: Colors.white60, fontSize: 12),
+                                      ),
+                                      Text(
+                                        _formatRoomCode(roomId),
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 28,
+                                          fontWeight: FontWeight.bold,
+                                          letterSpacing: 3,
+                                          fontFamily: 'monospace',
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                  const SizedBox(width: 8),
-                                  const Icon(Icons.copy, color: Colors.white70, size: 18),
+                                  const SizedBox(width: 12),
+                                  const Icon(Icons.copy, color: Colors.white70, size: 20),
                                 ],
                               ),
                             ),
