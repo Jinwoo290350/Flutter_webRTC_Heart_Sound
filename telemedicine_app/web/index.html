@@ -385,8 +385,13 @@
   var _pcmQueue = [];
   var _pcmStarted = false;
   var _pcmNextTime = 0;
-  var _CHUNK_DUR = 640 / 16000;  // 40ms — same duration, 16kHz rate
-  var _JITTER = 8;               // 8 chunks × 40ms = 320ms buffer (was 160ms) — 4G friendly
+  var _CHUNK_DUR = 640 / 16000;       // 40ms chunks @ 16kHz
+  var _JITTER_INIT = 12;              // 12 × 40ms = 480ms initial buffer
+  var _JITTER_MAX = 24;               // 960ms max (adaptive ceiling)
+  var _JITTER = _JITTER_INIT;         // current target — grows on underflow
+  var _underflowCount = 0;
+  var _UNDERFLOW_THRESHOLD = 0.040;   // 40ms tolerance before counting underflow
+  var _BIG_GAP_THRESHOLD = 1.000;     // 1s gap → drop & re-buffer with bigger _JITTER
 
   window._startPcmPlayback = function (dc) {
     if (!_pcmPlayCtx || _pcmPlayCtx.state === 'closed') {
@@ -422,6 +427,29 @@
         _pcmNextTime = _pcmPlayCtx.currentTime + 0.010;
       }
       if (_pcmStarted) {
+        var now = _pcmPlayCtx.currentTime;
+        var lag = now - _pcmNextTime; // positive = we're behind schedule (underflow)
+
+        // BIG gap: ตามไม่ทันเกิน 1 วินาที → drop accumulated chunks, re-buffer
+        if (lag > _BIG_GAP_THRESHOLD) {
+          _underflowCount++;
+          _JITTER = Math.min(_JITTER + 4, _JITTER_MAX); // grow more aggressively
+          console.log('[PCM] BIG gap ' + lag.toFixed(2) + 's → re-buffer, _JITTER=' + _JITTER);
+          _pcmStarted = false;
+          _pcmNextTime = 0;
+          // เก็บ queue ไว้ — รอจน fill ใหม่ถึง _JITTER แล้วเริ่มเล่นใหม่
+          return;
+        }
+
+        // Mild underflow: เลื่อนเวลา + ขยาย buffer เพื่อ smooth ครั้งหน้า
+        if (lag > _UNDERFLOW_THRESHOLD) {
+          _underflowCount++;
+          if (_JITTER < _JITTER_MAX) {
+            _JITTER = Math.min(_JITTER + 1, _JITTER_MAX);
+            console.log('[PCM] underflow #' + _underflowCount + ' lag=' + (lag * 1000).toFixed(0) + 'ms, grow _JITTER=' + _JITTER);
+          }
+        }
+
         while (_pcmQueue.length > 0) {
           var samples = _pcmQueue.shift();
           var buf = _pcmPlayCtx.createBuffer(1, samples.length, 16000);
@@ -429,7 +457,7 @@
           var src = _pcmPlayCtx.createBufferSource();
           src.buffer = buf;
           src.connect(_pcmBassFilter);
-          var t = Math.max(_pcmNextTime, _pcmPlayCtx.currentTime);
+          var t = Math.max(_pcmNextTime, now);
           src.start(t);
           _pcmNextTime = t + _CHUNK_DUR;
         }
@@ -438,6 +466,8 @@
     dc.addEventListener('close', function () {
       _pcmStarted = false;
       _pcmQueue = [];
+      _JITTER = _JITTER_INIT; // reset adaptive state — fresh session
+      _underflowCount = 0;
     });
   };
 
