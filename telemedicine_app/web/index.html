@@ -94,77 +94,36 @@
   })();
 
   // ============================================================
-  // Opus playback (voice) — Web Audio sink for <audio> elements
-  //   Mute: masterGain.disconnect() + ctx.suspend()
+  // Opus playback (voice) — DIRECT <audio> element playback
+  //   เล่นผ่าน element โดยตรง → WebRTC AEC3 เห็น reference signal → ตัด echo ได้
+  //   (Web Audio sink approach เก่าทำให้ AEC ตัด echo ไม่ได้ → echo ก้องในห้อง)
+  //   Mute: el.muted = true + el.volume = 0 (ทั้ง 2 layer)
   // ============================================================
   var _opusMuted = false;
-  var _audioSink = new Map(); // <audio> el → { ctx, masterGain }
 
   function _getAudioEls() {
     return Array.from(document.querySelectorAll('audio'));
   }
 
-  function _attachSink(el) {
-    if (_audioSink.has(el)) return;
-    if (!el.srcObject || el.srcObject.getAudioTracks().length === 0) return;
-    try {
-      var ctx = new (window.AudioContext || window.webkitAudioContext)();
-      var src = ctx.createMediaStreamSource(el.srcObject);
-      var masterGain = ctx.createGain();
-      masterGain.gain.value = _opusMuted ? 0 : 1;
-      src.connect(masterGain);
-      // ไม่ suspend ctx (กัน Chrome reinit audio device) — ใช้แค่ disconnect masterGain
-      if (!_opusMuted) {
-        masterGain.connect(ctx.destination);
-      }
-      ctx.resume().catch(function(){});
-      // Triple layer mute on element: muted=true + volume=0 — direct element output silent
-      el.muted = true;
-      el.volume = 0;
-      _audioSink.set(el, { ctx: ctx, masterGain: masterGain });
-    } catch (e) {
-      console.error('[Sink] attach error:', e);
+  function _applyMuteToElement(el) {
+    if (!el || !el.srcObject) return;
+    el.muted = _opusMuted;
+    el.volume = _opusMuted ? 0 : 1;
+    // auto-play (flutter_webrtc บางเวอร์ชันไม่ play เอง)
+    if (el.paused && !_opusMuted) {
+      el.play().catch(function(){});
     }
   }
 
-  function _detachSink(el) {
-    var s = _audioSink.get(el);
-    if (!s) return;
-    try { s.ctx.close().catch(function(){}); } catch(e) {}
-    _audioSink.delete(el);
-  }
-
+  // Enforcement loop: apply mute state on new/restored audio elements ทุก 800ms
   setInterval(function () {
-    _getAudioEls().forEach(function (el) {
-      if (el.srcObject && el.srcObject.getAudioTracks().length > 0) {
-        _attachSink(el);
-      } else if (_audioSink.has(el)) {
-        _detachSink(el);
-      }
-      // Re-enforce muted=true + volume=0 ทุก 800ms กัน flutter_webrtc reset
-      if (_audioSink.has(el)) {
-        if (el.muted !== true) el.muted = true;
-        if (el.volume !== 0) el.volume = 0;
-      }
-    });
+    _getAudioEls().forEach(_applyMuteToElement);
   }, 800);
 
-  // Mute via gain + disconnect — ไม่ suspend ctx เพราะ Chrome จะ reinit audio device
-  //   ทำให้ mic capture สะดุด (เคยทำให้ "พูดไม่ได้")
   window.setOpusMuted = function (muted) {
     _opusMuted = muted;
-    _audioSink.forEach(function (s) {
-      if (!s.masterGain || !s.ctx) return;
-      s.masterGain.gain.value = muted ? 0 : 1;
-      try {
-        if (muted) {
-          s.masterGain.disconnect();
-        } else {
-          s.masterGain.connect(s.ctx.destination);
-        }
-      } catch(e) {}
-    });
-    console.log('[Opus] muted=' + muted + ' sinks=' + _audioSink.size);
+    _getAudioEls().forEach(_applyMuteToElement);
+    console.log('[Opus] muted=' + muted + ' (direct element playback — AEC enabled)');
   };
 
   // ============================================================
@@ -563,7 +522,8 @@
       if (Ctx) new Ctx().resume();
     } catch(e) {}
     _getAudioEls().forEach(function (el) {
-      if (!_audioSink.has(el)) el.muted = false;
+      el.muted = _opusMuted; // respect current mute state
+      el.volume = _opusMuted ? 0 : 1;
       el.play().catch(function(){});
     });
     var el = document.getElementById('audio-unlock-overlay');
