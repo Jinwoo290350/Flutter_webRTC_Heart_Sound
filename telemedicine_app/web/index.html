@@ -96,26 +96,51 @@
   // ============================================================
   // Opus playback (voice) — DIRECT <audio> element playback
   //   เล่นผ่าน element โดยตรง → WebRTC AEC3 เห็น reference signal → ตัด echo ได้
-  //   (Web Audio sink approach เก่าทำให้ AEC ตัด echo ไม่ได้ → echo ก้องในห้อง)
-  //   Mute: el.muted = true + el.volume = 0 (ทั้ง 2 layer)
+  //   CRITICAL: ต้อง mute LOCAL audio element (จาก self-renderer) เพื่อกัน loopback:
+  //     Mic → local element → speaker → mic → loop → echo ก้อง
+  //   วิธี: intercept getUserMedia จับ local stream ID → element ที่มี srcObject ตรงนี้ = local → mute เสมอ
   // ============================================================
   var _opusMuted = false;
+  var _localStreamIds = new Set();
+
+  // Intercept getUserMedia → track local stream IDs (เพื่อแยก local vs remote audio element)
+  (function () {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+    var _origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = function (constraints) {
+      return _origGUM(constraints).then(function (stream) {
+        _localStreamIds.add(stream.id);
+        console.log('[Mic] local stream tracked id=' + stream.id);
+        return stream;
+      });
+    };
+  })();
 
   function _getAudioEls() {
     return Array.from(document.querySelectorAll('audio'));
   }
 
+  function _isLocalStreamEl(el) {
+    return el.srcObject && _localStreamIds.has(el.srcObject.id);
+  }
+
   function _applyMuteToElement(el) {
     if (!el || !el.srcObject) return;
+    // Local renderer audio = ALWAYS muted (prevent self-loopback echo)
+    if (_isLocalStreamEl(el)) {
+      el.muted = true;
+      el.volume = 0;
+      return;
+    }
+    // Remote stream = respect _opusMuted toggle
     el.muted = _opusMuted;
     el.volume = _opusMuted ? 0 : 1;
-    // auto-play (flutter_webrtc บางเวอร์ชันไม่ play เอง)
     if (el.paused && !_opusMuted) {
       el.play().catch(function(){});
     }
   }
 
-  // Enforcement loop: apply mute state on new/restored audio elements ทุก 800ms
+  // Enforcement loop: apply mute state ทุก 800ms (กัน flutter_webrtc reset)
   setInterval(function () {
     _getAudioEls().forEach(_applyMuteToElement);
   }, 800);
@@ -123,7 +148,7 @@
   window.setOpusMuted = function (muted) {
     _opusMuted = muted;
     _getAudioEls().forEach(_applyMuteToElement);
-    console.log('[Opus] muted=' + muted + ' (direct element playback — AEC enabled)');
+    console.log('[Opus] muted=' + muted + ' (direct playback, local elements muted)');
   };
 
   // ============================================================
