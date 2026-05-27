@@ -370,12 +370,14 @@
   var _pcmStarted = false;
   var _pcmNextTime = 0;
   var _CHUNK_DUR = 640 / 16000;       // 40ms chunks @ 16kHz
-  var _JITTER_INIT = 12;              // 12 × 40ms = 480ms initial buffer
-  var _JITTER_MAX = 24;               // 960ms max (adaptive ceiling)
+  // Balance: bigger = less stutter but more echo (AEC handle ≤500ms)
+  // 8 chunks = 320ms baseline — within WebRTC AEC3 echo cancellation window
+  var _JITTER_INIT = 8;
+  var _JITTER_MAX = 16;               // 640ms ceiling — still close to AEC limit
   var _JITTER = _JITTER_INIT;         // current target — grows on underflow
   var _underflowCount = 0;
-  var _UNDERFLOW_THRESHOLD = 0.040;   // 40ms tolerance before counting underflow
-  var _BIG_GAP_THRESHOLD = 1.000;     // 1s gap → drop & re-buffer with bigger _JITTER
+  var _UNDERFLOW_THRESHOLD = 0.080;   // 80ms tolerance (was 40ms — less sensitive)
+  var _BIG_GAP_THRESHOLD = 1.500;     // 1.5s gap → drop & re-buffer
 
   window._startPcmPlayback = function (dc) {
     if (!_pcmPlayCtx || _pcmPlayCtx.state === 'closed') {
