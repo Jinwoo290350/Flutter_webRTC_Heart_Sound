@@ -21,13 +21,14 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   bool _bassBoost = false;
 
   bool _prevHeartMode = false;
+  bool _listenMode = false;       // true = doctor's mic auto-muted to prevent echo loop
+  bool _wasMicOnBeforeListen = true; // restore mic state when leaving listen mode
 
   @override
   void initState() {
     super.initState();
     _remoteRenderer.initialize();
     _localRenderer.initialize();
-    // Listen for heart mode transitions — auto-unmute PCM when patient restarts heart sound
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       context.read<WebRTCService>().addListener(_onWebrtcChange);
@@ -42,7 +43,40 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
       setState(() => _pcmMuted = false);
       webrtc.setPcmMuted(false);
     }
+    // patient starts heart mode → suggest listen mode (auto-enter)
+    if (!_prevHeartMode && webrtc.heartMode && !_listenMode) {
+      _enterListenMode();
+    }
+    // patient stops heart mode → exit listen mode
+    if (_prevHeartMode && !webrtc.heartMode && _listenMode) {
+      _exitListenMode();
+    }
     _prevHeartMode = webrtc.heartMode;
+  }
+
+  void _enterListenMode() {
+    _wasMicOnBeforeListen = _micOn;
+    setState(() {
+      _listenMode = true;
+      _micOn = false;
+    });
+    context.read<WebRTCService>().toggleMic(false);
+  }
+
+  void _exitListenMode() {
+    setState(() {
+      _listenMode = false;
+      _micOn = _wasMicOnBeforeListen;
+    });
+    context.read<WebRTCService>().toggleMic(_wasMicOnBeforeListen);
+  }
+
+  void _toggleListenMode() {
+    if (_listenMode) {
+      _exitListenMode();
+    } else {
+      _enterListenMode();
+    }
   }
 
   @override
@@ -285,6 +319,16 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                           onToggleBass: _toggleBass,
                         ),
                       ),
+                    // Listen Mode banner — กดเพื่อ toggle mic mute (กัน echo ตอนฟังเสียงหัวใจ)
+                    if (connected)
+                      Positioned(
+                        top: webrtc.heartMode ? 60 : 12,
+                        left: 12,
+                        child: _ListenModeButton(
+                          active: _listenMode,
+                          onTap: _toggleListenMode,
+                        ),
+                      ),
                     Positioned(
                       left: 0,
                       right: 0,
@@ -479,6 +523,50 @@ class _ControlBar extends StatelessWidget {
               ),
             );
           }).toList(),
+        ),
+      ),
+    );
+  }
+}
+
+class _ListenModeButton extends StatelessWidget {
+  final bool active;
+  final VoidCallback onTap;
+  const _ListenModeButton({required this.active, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? Colors.deepPurple.shade700 : Colors.black.withValues(alpha: 0.65),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: active ? Colors.deepPurpleAccent : Colors.white24,
+            width: 1.5,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              active ? Icons.headset : Icons.headset_off,
+              color: active ? Colors.white : Colors.white70,
+              size: 16,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              active ? 'โหมดฟัง (mic ปิด)' : 'พูดได้',
+              style: TextStyle(
+                color: active ? Colors.white : Colors.white70,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
         ),
       ),
     );
