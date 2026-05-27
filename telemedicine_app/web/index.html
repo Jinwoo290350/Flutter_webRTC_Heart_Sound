@@ -140,15 +140,26 @@
     }
   }
 
+  // <video> element ทั้งหมดต้อง muted — เพราะ audio จะเล่นผ่าน <audio> separately
+  // ป้องกัน self-loopback: local renderer <video> ตัวเองเล่น local mic → ได้ยินเสียงตัวเอง
+  function _muteAllVideoElements() {
+    document.querySelectorAll('video').forEach(function (v) {
+      if (v.muted !== true) v.muted = true;
+      if (v.volume !== 0) v.volume = 0;
+    });
+  }
+
   // Enforcement loop: apply mute state ทุก 800ms (กัน flutter_webrtc reset)
   setInterval(function () {
     _getAudioEls().forEach(_applyMuteToElement);
+    _muteAllVideoElements();
   }, 800);
 
   window.setOpusMuted = function (muted) {
     _opusMuted = muted;
     _getAudioEls().forEach(_applyMuteToElement);
-    console.log('[Opus] muted=' + muted + ' (direct playback, local elements muted)');
+    _muteAllVideoElements();
+    console.log('[Opus] muted=' + muted + ' (direct playback, video+local muted)');
   };
 
   // ============================================================
