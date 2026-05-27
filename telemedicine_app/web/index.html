@@ -149,6 +149,35 @@
     });
   }
 
+  // Mute video elements ทันทีที่ถูกสร้าง (MutationObserver) — ก่อน 800ms enforcement loop
+  // กัน mobile self-loopback (กดเข้า patient screen → mic เปิด → ได้ยินเสียงตัวเองทันที)
+  (function () {
+    var observer = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        var added = mutations[i].addedNodes;
+        for (var j = 0; j < added.length; j++) {
+          var node = added[j];
+          if (node.tagName === 'VIDEO') {
+            node.muted = true;
+            node.volume = 0;
+          } else if (node.querySelectorAll) {
+            node.querySelectorAll('video').forEach(function (v) {
+              v.muted = true;
+              v.volume = 0;
+            });
+          }
+        }
+      }
+    });
+    if (document.body) {
+      observer.observe(document.body, { childList: true, subtree: true });
+    } else {
+      document.addEventListener('DOMContentLoaded', function () {
+        observer.observe(document.body, { childList: true, subtree: true });
+      });
+    }
+  })();
+
   // Enforcement loop: apply mute state ทุก 800ms (กัน flutter_webrtc reset)
   setInterval(function () {
     _getAudioEls().forEach(_applyMuteToElement);

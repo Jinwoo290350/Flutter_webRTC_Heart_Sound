@@ -62,14 +62,16 @@ class WebRTCService extends ChangeNotifier {
         _iceRestartAttempted = false;
         _setState(CallState.connected);
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+        // Slow networks (Slow 4G/3G) อาจใช้เวลาเป็นสิบวินาทีก่อน Connected → tolerance สูง
         _iceDisconnectTimer?.cancel();
-        _iceDisconnectTimer = Timer(const Duration(seconds: 3), () async {
+        _iceDisconnectTimer = Timer(const Duration(seconds: 15), () async {
           if (_peerConnection == null || _callState == CallState.ended) return;
           if (!_iceRestartAttempted) {
             try {
               _iceRestartAttempted = true;
+              debugPrint('WebRTCService: ICE restart after 15s disconnect');
               await _peerConnection!.restartIce();
-              _iceDisconnectTimer = Timer(const Duration(seconds: 5), hangUp);
+              _iceDisconnectTimer = Timer(const Duration(seconds: 20), hangUp);
             } catch (e) {
               debugPrint('WebRTCService: ICE restart failed: $e');
               hangUp();
@@ -79,7 +81,9 @@ class WebRTCService extends ChangeNotifier {
           }
         });
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        // Failed = ICE หมดทาง — ปล่อยให้ user รู้แล้ว manual retry
         _iceDisconnectTimer?.cancel();
+        debugPrint('WebRTCService: ICE failed — hanging up');
         hangUp();
       }
     };
