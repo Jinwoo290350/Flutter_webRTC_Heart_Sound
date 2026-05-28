@@ -199,6 +199,19 @@ class WebRTCService extends ChangeNotifier {
       _localStream = await navigator.mediaDevices.getUserMedia(
         WebRTCConfig.voiceConstraints,
       );
+      // Diagnostic: verify AEC/NS/AGC ทำงานจริงหลัง constraint apply
+      final audioTracks = _localStream!.getAudioTracks();
+      if (audioTracks.isNotEmpty) {
+        try {
+          final settings = audioTracks.first.getSettings();
+          debugPrint('[Mic] AEC=${settings['echoCancellation']} '
+              'NS=${settings['noiseSuppression']} '
+              'AGC=${settings['autoGainControl']} '
+              'sampleRate=${settings['sampleRate']}');
+        } catch (e) {
+          debugPrint('[Mic] getSettings error (non-fatal): $e');
+        }
+      }
       notifyListeners();
       return true;
     } catch (e) {

@@ -28,12 +28,21 @@ class WebRTCConfig {
 
   // ==================== Audio Constraints ====================
 
-  /// Phase 1: เสียงพูดทั่วไป — เปิด filter ปกติ
+  /// Voice constraints — บังคับ AEC + NS + AGC ด้วย {exact: true}
+  /// + legacy Chrome goog* constraints สำหรับ AEC3 (echo cancellation v3)
+  /// เป้าหมาย: ลด echo บน cross-device test เมื่อ Mac + มือถือ อยู่ห้องเดียวกัน
   static const Map<String, dynamic> voiceConstraints = {
     'audio': {
-      'echoCancellation': true,
-      'noiseSuppression': true,
-      'autoGainControl': true,
+      'echoCancellation': {'exact': true},
+      'noiseSuppression': {'exact': true},
+      'autoGainControl': {'exact': true},
+      // Legacy Chrome constraints — บังคับ AEC3 explicitly
+      'googEchoCancellation': true,
+      'googEchoCancellation2': true,    // AEC3 modern algorithm
+      'googNoiseSuppression': true,
+      'googHighpassFilter': true,
+      'googAutoGainControl': true,
+      'googTypingNoiseDetection': true,
     },
     'video': true,
   };

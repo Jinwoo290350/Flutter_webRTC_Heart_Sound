@@ -116,8 +116,12 @@
     };
   })();
 
-  function _getAudioEls() {
-    return Array.from(document.querySelectorAll('audio'));
+  function _getMediaEls() {
+    // Both <audio> และ <video> — flutter_webrtc web เล่น remote audio ผ่าน <video> ด้วย
+    return [
+      ...Array.from(document.querySelectorAll('audio')),
+      ...Array.from(document.querySelectorAll('video')),
+    ];
   }
 
   function _isLocalStreamEl(el) {
@@ -126,13 +130,13 @@
 
   function _applyMuteToElement(el) {
     if (!el || !el.srcObject) return;
-    // Local renderer audio = ALWAYS muted (prevent self-loopback echo)
+    // Local renderer = ALWAYS muted (prevent self-loopback: mic → local <video>/audio → speaker)
     if (_isLocalStreamEl(el)) {
-      el.muted = true;
-      el.volume = 0;
+      if (el.muted !== true) el.muted = true;
+      if (el.volume !== 0) el.volume = 0;
       return;
     }
-    // Remote stream = respect _opusMuted toggle
+    // Remote stream — respect _opusMuted (audio ของ remote เล่นได้ปกติ)
     el.muted = _opusMuted;
     el.volume = _opusMuted ? 0 : 1;
     if (el.paused && !_opusMuted) {
@@ -140,55 +144,37 @@
     }
   }
 
-  // <video> element ทั้งหมดต้อง muted — เพราะ audio จะเล่นผ่าน <audio> separately
-  // ป้องกัน self-loopback: local renderer <video> ตัวเองเล่น local mic → ได้ยินเสียงตัวเอง
-  function _muteAllVideoElements() {
-    document.querySelectorAll('video').forEach(function (v) {
-      if (v.muted !== true) v.muted = true;
-      if (v.volume !== 0) v.volume = 0;
-    });
-  }
-
-  // Mute video elements ทันทีที่ถูกสร้าง (MutationObserver) — ก่อน 800ms enforcement loop
-  // กัน mobile self-loopback (กดเข้า patient screen → mic เปิด → ได้ยินเสียงตัวเองทันที)
+  // MutationObserver: catch new media elements + recheck after srcObject set
+  // หมายเหตุ: ตอน element ถูกสร้างใหม่ srcObject อาจยังไม่ assign → _applyMuteToElement
+  //          จะ skip; enforcement loop จะ catch ภายใน 250ms warmup window
   (function () {
-    var observer = new MutationObserver(function (mutations) {
-      for (var i = 0; i < mutations.length; i++) {
-        var added = mutations[i].addedNodes;
-        for (var j = 0; j < added.length; j++) {
-          var node = added[j];
-          if (node.tagName === 'VIDEO') {
-            node.muted = true;
-            node.volume = 0;
-          } else if (node.querySelectorAll) {
-            node.querySelectorAll('video').forEach(function (v) {
-              v.muted = true;
-              v.volume = 0;
-            });
-          }
-        }
-      }
+    var observer = new MutationObserver(function () {
+      _getMediaEls().forEach(_applyMuteToElement);
     });
     if (document.body) {
-      observer.observe(document.body, { childList: true, subtree: true });
+      observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
     } else {
       document.addEventListener('DOMContentLoaded', function () {
-        observer.observe(document.body, { childList: true, subtree: true });
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
       });
     }
   })();
 
-  // Enforcement loop: apply mute state ทุก 800ms (กัน flutter_webrtc reset)
-  setInterval(function () {
-    _getAudioEls().forEach(_applyMuteToElement);
-    _muteAllVideoElements();
-  }, 800);
+  // Adaptive enforcement loop: 250ms × 20 cycles (5s warmup) → 800ms steady
+  // Warmup เร็วเพื่อ catch local stream ก่อน mobile user ได้ยินเสียงตัวเอง
+  var _enforceCount = 0;
+  function _enforceLoop() {
+    _getMediaEls().forEach(_applyMuteToElement);
+    _enforceCount++;
+    var nextDelay = _enforceCount < 20 ? 250 : 800;
+    setTimeout(_enforceLoop, nextDelay);
+  }
+  _enforceLoop();
 
   window.setOpusMuted = function (muted) {
     _opusMuted = muted;
-    _getAudioEls().forEach(_applyMuteToElement);
-    _muteAllVideoElements();
-    console.log('[Opus] muted=' + muted + ' (direct playback, video+local muted)');
+    _getMediaEls().forEach(_applyMuteToElement);
+    console.log('[Opus] muted=' + muted + ' (local elements always muted, remote = toggle)');
   };
 
   // ============================================================
