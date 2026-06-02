@@ -21,7 +21,6 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   bool _showSimPanel = false;
   bool _heartPlaying = false;
   bool _liveMode = false; // false = play sample WAV, true = live stethoscope mic
-  bool _halfDuplex = false; // walkie-talkie mode (anti acoustic feedback)
   bool _autoHdApplied = false; // auto-enable HD ครั้งเดียวตอน call connect
   HeartPosition _position = HeartPosition.aortic;
 
@@ -39,13 +38,10 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   void _onWebrtcChange() {
     if (!mounted) return;
     final webrtc = context.read<WebRTCService>();
-    // Show UI hint ตอน connect (ไม่ auto-enable HD เพราะกระทบ smoothness)
+    // Auto-enable HD ตอน connect (always-on — no toggle)
     if (!_autoHdApplied && webrtc.callState == CallState.connected) {
       _autoHdApplied = true;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('💡 ถ้าได้ยินเสียงตัวเอง → กด 🚶 Half-Duplex หรือใช้หูฟัง'),
-        duration: Duration(seconds: 4),
-      ));
+      webrtc.setHalfDuplex(true);
     }
   }
 
@@ -76,17 +72,6 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   void _toggleOpus() {
     setState(() => _opusMuted = !_opusMuted);
     context.read<WebRTCService>().setOpusMuted(_opusMuted);
-  }
-
-  void _toggleHalfDuplex() {
-    setState(() => _halfDuplex = !_halfDuplex);
-    context.read<WebRTCService>().setHalfDuplex(_halfDuplex);
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(_halfDuplex
-          ? '🚶 Half-Duplex เปิด — auto-mute mic เมื่อหมอพูด (กัน echo + whining)'
-          : 'Half-Duplex ปิด — full-duplex ปกติ'),
-      duration: const Duration(seconds: 2),
-    ));
   }
 
   Future<void> _toggleHeart() async {
@@ -290,14 +275,6 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
                           color: _opusMuted ? Colors.orange.shade700 : Colors.grey.shade700,
                           tooltip: _opusMuted ? 'เปิดเสียงหมอ' : 'ปิดเสียงหมอ',
                           onTap: _toggleOpus,
-                        ),
-                        _CtrlBtn(
-                          icon: _halfDuplex ? Icons.record_voice_over : Icons.voice_over_off,
-                          color: _halfDuplex ? Colors.teal.shade600 : Colors.grey.shade700,
-                          tooltip: _halfDuplex
-                              ? 'Half-Duplex เปิด (walkie-talkie) — กดเพื่อปิด'
-                              : 'Half-Duplex ปิด — กดเพื่อเปิด (กัน echo + whining)',
-                          onTap: _toggleHalfDuplex,
                         ),
                         _CtrlBtn(
                           icon: Icons.favorite,
