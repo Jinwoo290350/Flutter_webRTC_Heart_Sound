@@ -39,11 +39,13 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   void _onWebrtcChange() {
     if (!mounted) return;
     final webrtc = context.read<WebRTCService>();
-    // Auto-enable HD ตอน call connect — กัน cross-device acoustic loop ตั้งแต่ต้น
+    // Show UI hint ตอน connect (ไม่ auto-enable HD เพราะกระทบ smoothness)
     if (!_autoHdApplied && webrtc.callState == CallState.connected) {
       _autoHdApplied = true;
-      setState(() => _halfDuplex = true);
-      webrtc.setHalfDuplex(true);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('💡 ถ้าได้ยินเสียงตัวเอง → กด 🚶 Half-Duplex หรือใช้หูฟัง'),
+        duration: Duration(seconds: 4),
+      ));
     }
   }
 
