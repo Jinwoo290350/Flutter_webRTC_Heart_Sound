@@ -102,17 +102,20 @@
   // ============================================================
   var _opusMuted = false;
   var _localStreamIds = new Set();
+  var _localTrackIds = new Set();       // track IDs — robust ต่อ flutter_webrtc wrapping MediaStream ใหม่
   var _localAudioTracks = new Set();    // tracked for Half-Duplex VAD auto-mute
 
-  // Intercept getUserMedia → track local stream IDs (เพื่อแยก local vs remote audio element)
+  // Intercept getUserMedia → track local stream + track IDs (เพื่อแยก local vs remote)
   (function () {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
     var _origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getUserMedia = function (constraints) {
       return _origGUM(constraints).then(function (stream) {
         _localStreamIds.add(stream.id);
+        stream.getTracks().forEach(function (t) { _localTrackIds.add(t.id); });
         stream.getAudioTracks().forEach(function (t) { _localAudioTracks.add(t); });
-        console.log('[Mic] local stream tracked id=' + stream.id);
+        console.log('[Mic] local stream tracked id=' + stream.id +
+                    ' tracks=' + stream.getTracks().map(function(t){return t.kind+':'+t.id.slice(0,8);}).join(','));
         return stream;
       });
     };
@@ -127,13 +130,31 @@
   }
 
   function _isLocalStreamEl(el) {
-    return el.srcObject && _localStreamIds.has(el.srcObject.id);
+    if (!el.srcObject) return false;
+    // 1. Direct: srcObject.id ตรงกับ getUserMedia stream
+    if (_localStreamIds.has(el.srcObject.id)) return true;
+    // 2. Fallback: flutter_webrtc อาจ wrap stream → stream id ไม่ตรง แต่ track id ยังคงเดิม
+    try {
+      var tracks = el.srcObject.getTracks();
+      for (var i = 0; i < tracks.length; i++) {
+        if (_localTrackIds.has(tracks[i].id)) return true;
+      }
+    } catch(_) {}
+    return false;
   }
 
   function _applyMuteToElement(el) {
     if (!el || !el.srcObject) return;
+    var isLocal = _isLocalStreamEl(el);
+    // One-shot diagnostic log per element (debug local mute matching)
+    if (!el.__hdLogged) {
+      el.__hdLogged = true;
+      var tracks = (function(){ try { return el.srcObject.getTracks().map(function(t){return t.kind+':'+t.id.slice(0,8);}).join(','); } catch(_){ return '?'; }})();
+      console.log('[MediaEl] ' + el.tagName + ' srcObj=' + el.srcObject.id.slice(0,8) +
+                  ' tracks=' + tracks + ' → ' + (isLocal ? 'LOCAL (muted)' : 'REMOTE (play)'));
+    }
     // Local renderer = ALWAYS muted (prevent self-loopback: mic → local <video>/audio → speaker)
-    if (_isLocalStreamEl(el)) {
+    if (isLocal) {
       if (el.muted !== true) el.muted = true;
       if (el.volume !== 0) el.volume = 0;
       return;
@@ -569,9 +590,10 @@
   var _hdRemoteEl = null;
   var _hdMutedTracks = new Set();        // tracks HD muted — only HD will unmute
   var _hdActive = false;                  // currently auto-muting?
-  var _HD_THRESHOLD = 12;                 // 0-255 byte freq avg — speech > 10-15 (ไวขึ้น → echo trail สั้น)
-  var _HD_HANGOVER_MS = 300;
+  var _HD_THRESHOLD = 15;                 // 0-255 byte freq avg — speech > 12-18
+  var _HD_HANGOVER_MS = 600;              // ครอบคลุม natural speech pause (syllable gap < 400ms)
   var _HD_POLL_MS = 50;
+  var _hdLastLogMs = 0;                   // ratelimit logs — กัน console spam
 
   function _hdAttachRemote() {
     var remoteEl = _getMediaEls().find(function (el) {
@@ -599,11 +621,15 @@
           _hdMutedTracks.add(t);
         }
       });
-      console.log('[HalfDuplex] mic auto-muted (remote talking) — ' + _hdMutedTracks.size + ' track(s)');
     } else {
       _hdMutedTracks.forEach(function (t) { t.enabled = true; });
       _hdMutedTracks.clear();
-      console.log('[HalfDuplex] mic auto-unmuted');
+    }
+    // Ratelimit log → at most 1 per second (กัน flicker spam)
+    var now = Date.now();
+    if (now - _hdLastLogMs > 1000) {
+      _hdLastLogMs = now;
+      console.log('[HalfDuplex] ' + (shouldMute ? 'mic muted (remote talking)' : 'mic unmuted'));
     }
   }
 

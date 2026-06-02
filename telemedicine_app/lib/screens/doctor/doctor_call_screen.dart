@@ -24,6 +24,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   bool _listenMode = false;       // true = doctor's mic auto-muted to prevent echo loop
   bool _wasMicOnBeforeListen = true; // restore mic state when leaving listen mode
   bool _halfDuplex = false;       // walkie-talkie mode (anti acoustic feedback)
+  bool _autoHdApplied = false;    // auto-enable HD ครั้งเดียวตอน call connect
 
   @override
   void initState() {
@@ -39,6 +40,12 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   void _onWebrtcChange() {
     if (!mounted) return;
     final webrtc = context.read<WebRTCService>();
+    // Auto-enable HD ตอน call connect — กัน cross-device acoustic loop ตั้งแต่ต้น
+    if (!_autoHdApplied && webrtc.callState == CallState.connected) {
+      _autoHdApplied = true;
+      setState(() => _halfDuplex = true);
+      webrtc.setHalfDuplex(true);
+    }
     // patient restart heart sound (false → true): auto-unmute doctor's PCM
     if (!_prevHeartMode && webrtc.heartMode && _pcmMuted) {
       setState(() => _pcmMuted = false);

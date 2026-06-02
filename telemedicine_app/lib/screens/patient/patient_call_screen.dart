@@ -22,6 +22,7 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   bool _heartPlaying = false;
   bool _liveMode = false; // false = play sample WAV, true = live stethoscope mic
   bool _halfDuplex = false; // walkie-talkie mode (anti acoustic feedback)
+  bool _autoHdApplied = false; // auto-enable HD ครั้งเดียวตอน call connect
   HeartPosition _position = HeartPosition.aortic;
 
   @override
@@ -29,10 +30,26 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
     super.initState();
     _remoteRenderer.initialize();
     _localRenderer.initialize();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      context.read<WebRTCService>().addListener(_onWebrtcChange);
+    });
+  }
+
+  void _onWebrtcChange() {
+    if (!mounted) return;
+    final webrtc = context.read<WebRTCService>();
+    // Auto-enable HD ตอน call connect — กัน cross-device acoustic loop ตั้งแต่ต้น
+    if (!_autoHdApplied && webrtc.callState == CallState.connected) {
+      _autoHdApplied = true;
+      setState(() => _halfDuplex = true);
+      webrtc.setHalfDuplex(true);
+    }
   }
 
   @override
   void dispose() {
+    try { context.read<WebRTCService>().removeListener(_onWebrtcChange); } catch (_) {}
     _remoteRenderer.dispose();
     _localRenderer.dispose();
     super.dispose();
