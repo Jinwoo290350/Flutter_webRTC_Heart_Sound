@@ -129,6 +129,8 @@ class SignalingService {
   /// อัปโหลด ICE candidate ของตัวเองไปยัง Firestore
   /// [role]: 'caller' (patient) หรือ 'callee' (doctor)
   Future<void> addIceCandidate(RTCIceCandidate candidate, String role) async {
+    // ICE candidates อาจ gather เสร็จก่อน createRoom/joinRoom — ละเว้น (peer จะ generate ใหม่หลังจาก setRemoteDescription)
+    if (_roomRef == null) return;
     await _roomRef!
         .collection('${role}_${FirebaseConfig.candidatesCollection}')
         .add({

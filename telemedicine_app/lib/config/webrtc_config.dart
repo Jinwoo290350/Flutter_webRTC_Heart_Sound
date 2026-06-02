@@ -44,7 +44,15 @@ class WebRTCConfig {
       'googAutoGainControl': true,
       'googTypingNoiseDetection': true,
     },
-    'video': true,
+    // Explicit constraints — Android Chrome tablet ขอ default 1280x720@30 อาจกระชาก
+    // budget b=AS:500 ที่ SDP cap ไว้ → frame drop. ใช้ ideal (ไม่ใช่ exact) → graceful
+    // fallback ถ้า hardware ไม่ตรง
+    'video': {
+      'width': {'ideal': 640},
+      'height': {'ideal': 480},
+      'frameRate': {'ideal': 24, 'max': 30},
+      'facingMode': 'user',
+    },
   };
 
   // ==================== SDP Manipulation ====================

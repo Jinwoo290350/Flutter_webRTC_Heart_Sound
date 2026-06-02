@@ -23,6 +23,7 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   bool _prevHeartMode = false;
   bool _listenMode = false;       // true = doctor's mic auto-muted to prevent echo loop
   bool _wasMicOnBeforeListen = true; // restore mic state when leaving listen mode
+  bool _halfDuplex = false;       // walkie-talkie mode (anti acoustic feedback)
 
   @override
   void initState() {
@@ -121,6 +122,17 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
   void _toggleBass() {
     setState(() => _bassBoost = !_bassBoost);
     context.read<WebRTCService>().setBassBoost(_bassBoost);
+  }
+
+  void _toggleHalfDuplex() {
+    setState(() => _halfDuplex = !_halfDuplex);
+    context.read<WebRTCService>().setHalfDuplex(_halfDuplex);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(_halfDuplex
+          ? '🚶 Half-Duplex เปิด — auto-mute mic เมื่อ peer พูด (กัน echo + whining)'
+          : 'Half-Duplex ปิด — full-duplex ปกติ'),
+      duration: const Duration(seconds: 2),
+    ));
   }
 
   Future<void> _hangup() async {
@@ -345,6 +357,14 @@ class _DoctorCallScreenState extends State<DoctorCallScreen> {
                           color: _opusMuted ? Colors.orange.shade700 : Colors.grey.shade700,
                           tooltip: 'Opus (voice)',
                           onTap: _toggleOpus,
+                        ),
+                        _CtrlBtn(
+                          icon: _halfDuplex ? Icons.record_voice_over : Icons.voice_over_off,
+                          color: _halfDuplex ? Colors.teal.shade600 : Colors.grey.shade700,
+                          tooltip: _halfDuplex
+                              ? 'Half-Duplex เปิด (walkie-talkie) — กดเพื่อปิด'
+                              : 'Half-Duplex ปิด — กดเพื่อเปิด (กัน echo + whining)',
+                          onTap: _toggleHalfDuplex,
                         ),
                         _CtrlBtn(
                           icon: _pcmMuted ? Icons.heart_broken : Icons.favorite,

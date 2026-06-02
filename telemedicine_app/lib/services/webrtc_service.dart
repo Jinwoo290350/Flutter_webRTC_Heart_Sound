@@ -49,9 +49,16 @@ class WebRTCService extends ChangeNotifier {
     _peerConnection = await createPeerConnection(WebRTCConfig.iceServers);
 
     _peerConnection!.onIceCandidate = (candidate) {
-      if (candidate.candidate != null) {
-        final role = _callState == CallState.calling ? 'caller' : 'callee';
-        _signaling.addIceCandidate(candidate, role);
+      if (candidate.candidate == null) return;
+      final role = _callState == CallState.calling ? 'caller' : 'callee';
+      // ICE candidates อาจ fire ก่อน room ถูกสร้าง (race ระหว่าง gathering กับ createRoom)
+      // → addIceCandidate ใน signaling จะ no-op ถ้า _roomRef ยัง null. wrap try/catch กัน flood
+      try {
+        _signaling.addIceCandidate(candidate, role).catchError((e) {
+          debugPrint('WebRTCService: addIceCandidate async error: $e');
+        });
+      } catch (e) {
+        debugPrint('WebRTCService: addIceCandidate sync error: $e');
       }
     };
 
@@ -212,10 +219,33 @@ class WebRTCService extends ChangeNotifier {
           debugPrint('[Mic] getSettings error (non-fatal): $e');
         }
       }
+      // Diagnostic: video track count + resolution
+      // tracks=0 = camera permission denied; tracks=1 + width=null = silent broken track
+      final videoTracks = _localStream!.getVideoTracks();
+      debugPrint('[Cam] tracks=${videoTracks.length}');
+      if (videoTracks.isNotEmpty) {
+        try {
+          final s = videoTracks.first.getSettings();
+          debugPrint('[Cam] ${s['width']}x${s['height']}@${s['frameRate']} '
+              'facing=${s['facingMode']} deviceId=${s['deviceId']}');
+        } catch (e) {
+          debugPrint('[Cam] getSettings error (non-fatal): $e');
+        }
+      }
       notifyListeners();
       return true;
     } catch (e) {
-      _setError('ไม่สามารถเปิดกล้อง/ไมค์: $e');
+      final msg = e.toString();
+      if (msg.contains('NotAllowedError') || msg.contains('PermissionDenied')) {
+        _setError('กรุณาอนุญาตเปิดกล้องและไมโครโฟน');
+      } else if (msg.contains('NotFoundError') ||
+          msg.contains('DevicesNotFound')) {
+        _setError('ไม่พบกล้องหรือไมโครโฟน — เช็คว่ามีอุปกรณ์ต่ออยู่');
+      } else if (msg.contains('OverconstrainedError')) {
+        _setError('กล้องไม่รองรับ resolution ที่ขอ');
+      } else {
+        _setError('ไม่สามารถเปิดกล้อง/ไมค์: $e');
+      }
       return false;
     }
   }
@@ -377,6 +407,15 @@ class WebRTCService extends ChangeNotifier {
   void setPcmMuted(bool muted) {
     if (kIsWeb) {
       audio_js.setPcmMuted(muted);
+    }
+    notifyListeners();
+  }
+
+  /// Half-Duplex (walkie-talkie) — auto-mute local mic เมื่อ peer พูด
+  /// แก้ acoustic feedback loop (self-echo + whining) บน same-room test
+  void setHalfDuplex(bool enabled) {
+    if (kIsWeb) {
+      audio_js.setHalfDuplex(enabled);
     }
     notifyListeners();
   }

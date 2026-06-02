@@ -28,6 +28,9 @@ external JSPromise _jsStartRecording();
 @JS('stopRecording')
 external JSPromise<JSString> _jsStopRecording();
 
+@JS('setHalfDuplex')
+external void _jsSetHalfDuplex(JSBoolean enabled);
+
 void setOpusMuted(bool muted) {
   try { _jsSetOpusMuted(muted.toJS); } catch (_) {}
 }
@@ -66,4 +69,8 @@ Future<String> stopRecording() async {
     final result = await _jsStopRecording().toDart;
     return result.toDart;
   } catch (_) { return ''; }
+}
+
+void setHalfDuplex(bool enabled) {
+  try { _jsSetHalfDuplex(enabled.toJS); } catch (_) {}
 }
