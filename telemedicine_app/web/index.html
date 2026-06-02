@@ -104,6 +104,7 @@
   var _localStreamIds = new Set();
   var _localTrackIds = new Set();       // track IDs — robust ต่อ flutter_webrtc wrapping MediaStream ใหม่
   var _localAudioTracks = new Set();    // tracked for Half-Duplex VAD auto-mute
+  var _expanderActive = false;          // soft expander active → remote element muted, playback ผ่าน Web Audio
 
   // Intercept getUserMedia → track local stream + track IDs (เพื่อแยก local vs remote)
   (function () {
@@ -159,11 +160,18 @@
       if (el.volume !== 0) el.volume = 0;
       return;
     }
-    // Remote stream — respect _opusMuted (audio ของ remote เล่นได้ปกติ)
-    el.muted = _opusMuted;
-    el.volume = _opusMuted ? 0 : 1;
-    if (el.paused && !_opusMuted) {
-      el.play().catch(function(){});
+    // Remote stream:
+    //   - ถ้า expander active → element เสมอ muted (Web Audio handle playback) + opus mute ผ่าน expander gain
+    //   - ถ้า expander ปิด → fallback ตามเดิม (el.muted = _opusMuted)
+    if (_expanderActive) {
+      if (el.muted !== true) el.muted = true;
+      el.volume = 0;
+    } else {
+      el.muted = _opusMuted;
+      el.volume = _opusMuted ? 0 : 1;
+    }
+    if (el.paused) {
+      el.play().catch(function(){});   // เก็บ playing เพื่อให้ MediaStreamSource (expander) ดึง audio ได้
     }
   }
 
@@ -196,8 +204,12 @@
 
   window.setOpusMuted = function (muted) {
     _opusMuted = muted;
+    // ถ้า expander active → ปรับ output gain ของ Web Audio chain (element ยัง muted เสมอ)
+    if (_expanderActive && _expOutputGain) {
+      _expOutputGain.gain.value = muted ? 0 : 1;
+    }
     _getMediaEls().forEach(_applyMuteToElement);
-    console.log('[Opus] muted=' + muted + ' (local elements always muted, remote = toggle)');
+    console.log('[Opus] muted=' + muted + (_expanderActive ? ' (via expander gain)' : ' (via element)'));
   };
 
   // ============================================================
@@ -681,6 +693,126 @@
   function _hdStopPoll() {
     if (_hdInterval) { clearInterval(_hdInterval); _hdInterval = null; }
   }
+
+  // ============================================================
+  // Soft Expander — receive-side echo suppression
+  //   remote audio → AnalyserNode → GainNode (variable) → destination
+  //   เสียงเบา (echo feedback ~-20dB) → gain ลด -20dB → -40dB รวม inaudible
+  //   เสียงปกติ (B speech) → gain เต็ม → ไม่กระทบ conversation
+  //   smooth attack 20ms (จับ onset) / release 150ms (no click)
+  // ============================================================
+  var _expCtx = null;
+  var _expSrc = null;
+  var _expAnalyser = null;
+  var _expGain = null;             // expander gain (level-driven, attack/release smoothed)
+  var _expOutputGain = null;       // separate gain for setOpusMuted control
+  var _expRemoteEl = null;
+  var _expInterval = null;
+  var _expCurrentlyGated = false;  // ratelimited log state
+  var _expLastLogMs = 0;
+  var _EXP_THRESHOLD = 18;         // 0-255 byte freq avg — speech > 25, echo feedback < 15
+  var _EXP_HIGH = 1.0;             // normal speech passes through
+  var _EXP_LOW = 0.1;              // -20dB attenuation for low-level (echo feedback)
+  var _EXP_ATTACK_TC = 0.020;      // setTargetAtTime time constant — 20ms attack
+  var _EXP_RELEASE_TC = 0.150;     // 150ms release
+  var _EXP_POLL_MS = 20;
+
+  function _expAttachRemote() {
+    var remoteEl = _getMediaEls().find(function (el) {
+      return el.srcObject && !_isLocalStreamEl(el);
+    });
+    if (!remoteEl) return false;
+    _expRemoteEl = remoteEl;
+    _expCtx = new (window.AudioContext || window.webkitAudioContext)();
+    _expSrc = _expCtx.createMediaStreamSource(remoteEl.srcObject);
+    _expAnalyser = _expCtx.createAnalyser();
+    _expAnalyser.fftSize = 256;
+    _expAnalyser.smoothingTimeConstant = 0.5;
+    _expGain = _expCtx.createGain();
+    _expGain.gain.value = _EXP_HIGH;
+    _expOutputGain = _expCtx.createGain();
+    _expOutputGain.gain.value = _opusMuted ? 0 : 1;
+
+    // chain: src → analyser → gain (level-driven) → outputGain (opus mute) → destination
+    _expSrc.connect(_expAnalyser);
+    _expAnalyser.connect(_expGain);
+    _expGain.connect(_expOutputGain);
+    _expOutputGain.connect(_expCtx.destination);
+
+    // Now route playback through Web Audio → mute remote <audio> element
+    _expandSetRemoteElsMuted(true);
+    console.log('[Expander] attached to remote element (sampleRate=' + _expCtx.sampleRate + ')');
+    return true;
+  }
+
+  function _expandSetRemoteElsMuted(muted) {
+    _getMediaEls().forEach(function (el) {
+      if (el.srcObject && !_isLocalStreamEl(el)) {
+        el.muted = muted;
+        if (muted) el.volume = 0;
+        if (el.paused) el.play().catch(function(){});
+      }
+    });
+  }
+
+  function _expStartPoll() {
+    if (_expInterval) return;
+    var data = new Uint8Array(_expAnalyser.frequencyBinCount);
+    _expInterval = setInterval(function () {
+      if (!_expanderActive || !_expAnalyser) return;
+      _expAnalyser.getByteFrequencyData(data);
+      var sum = 0;
+      for (var i = 0; i < data.length; i++) sum += data[i];
+      var avg = sum / data.length;
+      var aboveThreshold = avg > _EXP_THRESHOLD;
+      var target = aboveThreshold ? _EXP_HIGH : _EXP_LOW;
+      var tc = (target > _expGain.gain.value) ? _EXP_ATTACK_TC : _EXP_RELEASE_TC;
+      _expGain.gain.setTargetAtTime(target, _expCtx.currentTime, tc / 3);
+
+      // ratelimit log on state changes
+      var gated = !aboveThreshold;
+      if (gated !== _expCurrentlyGated) {
+        _expCurrentlyGated = gated;
+        var now = Date.now();
+        if (now - _expLastLogMs > 1000) {
+          _expLastLogMs = now;
+          console.log('[Expander] ' + (gated ? 'gated (low level, suppressing echo)' : 'open (speech detected)') + ' avg=' + avg.toFixed(0));
+        }
+      }
+    }, _EXP_POLL_MS);
+  }
+
+  window.enableSoftExpander = function () {
+    if (_expanderActive) return;
+    _expanderActive = true;
+    var attempts = 0;
+    var tryAttach = function () {
+      if (!_expanderActive) return;
+      if (_expAttachRemote()) {
+        _expStartPoll();
+      } else if (attempts++ < 20) {
+        setTimeout(tryAttach, 500);
+      } else {
+        console.warn('[Expander] giving up — no remote element after 10s');
+        _expanderActive = false;
+      }
+    };
+    tryAttach();
+    console.log('[Expander] ENABLED');
+  };
+
+  window.disableSoftExpander = function () {
+    if (!_expanderActive) return;
+    _expanderActive = false;
+    if (_expInterval) { clearInterval(_expInterval); _expInterval = null; }
+    // Restore element playback (no Web Audio routing anymore)
+    _expandSetRemoteElsMuted(_opusMuted);
+    if (_expCtx) { try { _expCtx.close(); } catch(_){} }
+    _expCtx = null; _expSrc = null; _expAnalyser = null;
+    _expGain = null; _expOutputGain = null; _expRemoteEl = null;
+    _expCurrentlyGated = false;
+    console.log('[Expander] DISABLED');
+  };
 
   // ============================================================
   // Recording — MediaRecorder บน remote audio (Doctor side)

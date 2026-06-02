@@ -9,3 +9,5 @@ Future<void> stopStethMic() async {}
 Future<void> startRecording() async {}
 Future<String> stopRecording() async => '';
 void setHalfDuplex(bool enabled) {}
+void enableSoftExpander() {}
+void disableSoftExpander() {}

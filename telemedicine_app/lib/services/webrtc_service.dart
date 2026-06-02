@@ -420,6 +420,20 @@ class WebRTCService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Soft Expander — Web Audio chain ลด level ของ remote audio ที่เบา (~echo feedback)
+  /// ลง -20dB โดยไม่แตะ mic. Suppress self-echo แบบ smooth (ไม่ chop conversation)
+  void enableSoftExpander() {
+    if (kIsWeb) {
+      audio_js.enableSoftExpander();
+    }
+  }
+
+  void disableSoftExpander() {
+    if (kIsWeb) {
+      audio_js.disableSoftExpander();
+    }
+  }
+
   /// Patient: เริ่มส่งเสียงหัวใจ (replace mic with SimAudio + send via PCM DC)
   Future<void> startHeartSound(String assetPath, String positionLabel) async {
     if (!kIsWeb) return; // web-only for now

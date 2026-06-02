@@ -31,6 +31,12 @@ external JSPromise<JSString> _jsStopRecording();
 @JS('setHalfDuplex')
 external void _jsSetHalfDuplex(JSBoolean enabled);
 
+@JS('enableSoftExpander')
+external void _jsEnableSoftExpander();
+
+@JS('disableSoftExpander')
+external void _jsDisableSoftExpander();
+
 void setOpusMuted(bool muted) {
   try { _jsSetOpusMuted(muted.toJS); } catch (_) {}
 }
@@ -73,4 +79,12 @@ Future<String> stopRecording() async {
 
 void setHalfDuplex(bool enabled) {
   try { _jsSetHalfDuplex(enabled.toJS); } catch (_) {}
+}
+
+void enableSoftExpander() {
+  try { _jsEnableSoftExpander(); } catch (_) {}
+}
+
+void disableSoftExpander() {
+  try { _jsDisableSoftExpander(); } catch (_) {}
 }

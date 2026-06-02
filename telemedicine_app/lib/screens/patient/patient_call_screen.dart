@@ -38,10 +38,10 @@ class _PatientCallScreenState extends State<PatientCallScreen> {
   void _onWebrtcChange() {
     if (!mounted) return;
     final webrtc = context.read<WebRTCService>();
-    // Auto-enable HD ตอน connect (always-on — no toggle)
+    // Auto-enable Soft Expander ตอน connect — suppress self-echo โดยไม่ chop conversation
     if (!_autoHdApplied && webrtc.callState == CallState.connected) {
       _autoHdApplied = true;
-      webrtc.setHalfDuplex(true);
+      webrtc.enableSoftExpander();
     }
   }
 
