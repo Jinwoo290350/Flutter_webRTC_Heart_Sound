@@ -72,10 +72,11 @@ class WebRTCConfig {
       RegExp(r'(a=fmtp:\d+ .*)'),
       (m) => '${m[1]};$opusParams',
     );
-    // จำกัด video bitrate 500 kbps — audio priority บนเน็ตช้า
+    // จำกัด video bitrate 800 kbps — Android tablet hardware encoder อาจ burst เกิน 500
+    // ที่ 640x480@24 → frame drop. 800 ให้ headroom + ยัง audio priority บนเน็ตช้า
     result = result.replaceAllMapped(
       RegExp(r'(m=video [^\r\n]*)'),
-      (m) => '${m[1]}\r\nb=AS:500',
+      (m) => '${m[1]}\r\nb=AS:800',
     );
     return result;
   }

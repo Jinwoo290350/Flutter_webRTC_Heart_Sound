@@ -24,9 +24,11 @@
 ```
 
 ### หลักการ:
-- **Voice = Opus** (WebRTC audio track) → high-quality voice, AEC/NS/AGC default + `usedtx=0` กันเสียงตัดท้าย
-- **Heart sound = PCM RTCDataChannel** → lossless (Int16 768 kbps), bass 20-200Hz ไม่ถูกตัด
+- **Voice = Opus** (WebRTC audio track) → high-quality voice, AEC/NS/AGC `{exact:true}` + 6 goog flags + `usedtx=0` กันเสียงตัดท้าย
+- **Heart sound = PCM RTCDataChannel** → lossless (Int16 16kHz mono ~256 kbps), bass 20-200Hz ไม่ถูกตัด
+- **PCM playback = AudioWorklet ring buffer (2s)** — pull-mode audio thread, ไม่มี BufferSource scheduling drift, underrun = silence ไม่ crash
 - **2 channels พร้อมกัน** — คุยพูดคุยขณะส่งเสียงหัวใจได้
+- **Self-echo suppression = Local-mic VAD duck** — local mic AnalyserNode → A พูด → A's remote `<audio>.volume → 0.1 (-20dB)` 400ms hangover → ไม่ chop conversation, AEC reference intact
 - **Mute = local-only** ไม่ใช่ bilateral — แต่ละฝั่งคุมตัวเอง + ❤️ มี cooperative `stopHeart` signal (P2P DC) ลด bandwidth
 - **Cache-bust อัตโนมัติ** ใน `start_test_server.sh` กัน browser โหลด stale main.dart.js
 
@@ -154,43 +156,48 @@ telemedicine_app/
 
 ### Patient Side
 
-**SimAudio (🎵 Sample mode)** — single `AudioContext`:
+**SimAudio (🎵 Sample mode)** — single `AudioContext` @ 16kHz:
 ```
 fetch(WAV) → decodeAudioData (cached) → BufferSource(loop)
-            → AudioWorklet 'steth-capture' (1920 samples = 40ms @ 48kHz)
-            → Int16 quantize → RTCDataChannel.send (Int16 = 768 kbps)
+            → AudioWorklet 'steth-capture' (640 samples = 40ms @ 16kHz)
+            → Int16 quantize → RTCDataChannel.send (~256 kbps)
 ```
 
 **Live stethoscope (🩺 Live mode)** — separate `getUserMedia` filters OFF:
 ```
 { echoCancellation: {exact:false}, noiseSuppression:{exact:false},
-  autoGainControl: {exact:false}, sampleRate: 48000 }
+  autoGainControl: {exact:false}, sampleRate: 16000 }
 → MediaStreamSource → AudioWorklet → Int16 → DataChannel
 ```
 
 ### Doctor Side
 
-**PCM Playback** — jitter buffer 4 chunks × 40ms = 160ms:
+**PCM Playback** — AudioWorklet ring buffer (2s = 32000 samples), pre-fill 320ms PC / 640ms Android:
 ```
-DataChannel.onmessage → Int16Array → Float32Array
-                      → AudioBuffer → BufferSource scheduled
+DataChannel.onmessage → Int16Array → Float32Array → port.postMessage to worklet
+                      ↓
+        AudioWorkletProcessor pulls samples on-demand (audio thread)
                       → BiquadFilter (lowshelf 200Hz, Bass+6dB optional)
                       → masterGain (mute control)
                       → ctx.destination
 ```
+Underrun = output silence (no crash). Eliminates BufferSource scheduling drift on Android.
 
-**Opus Sink** — Web Audio capture of `<audio>` element:
+**Opus playback (direct element + Soft Expander ducking):**
 ```
-flutter_webrtc creates <audio> in #html_webrtc_audio_manager_list
-→ createMediaStreamSource(el.srcObject)
-→ masterGain → ctx.destination
-+ el.muted=true + el.volume=0 (defense in depth)
+flutter_webrtc creates <audio> with remote stream
+→ element.muted=false (Chrome AEC requires unmuted element as reference signal)
+→ element.volume controlled by JS local-mic VAD:
+    local mic AnalyserNode → A speaks (avg > 20) → ramp volume → 0.1 (-20dB)
+    A silent 400ms hangover → ramp volume → 1.0
+→ speaker
 ```
+Local stream elements: muted=true + volume=0 (track-id fallback prevents self-loopback even when flutter_webrtc wraps stream).
 
 ### SDP (Opus tuning)
 ```
 a=fmtp:<pt> usedtx=0;maxplaybackrate=48000;sprop-maxcapturerate=48000;stereo=0;sprop-stereo=0
-m=video ... b=AS:500   ; cap video at 500 kbps
+m=video ... b=AS:800   ; cap video at 800 kbps (headroom for Android tablet hw encoder burst)
 ```
 
 ---
@@ -213,9 +220,10 @@ m=video ... b=AS:500   ; cap video at 500 kbps
 
 - **Native iOS/Android**: heart sound feature (SimAudio + Live mic + PCM playback) ไม่รองรับ — ใช้ได้แค่ video call + voice (ดู Roadmap)
 - **Same-machine testing**: ต้องใช้หูฟัง หรือ mute ปุ่ม 🎤 ตัด acoustic loop
-- **PCM bandwidth**: 768 kbps (Int16 × 48kHz mono) — ต้อง mobile 4G+ ขึ้นไป
+- **PCM bandwidth**: ~256 kbps (Int16 × 16kHz mono) — เพียงพอ mobile 4G ทั่วไป
 - **Recording**: blob URL ใน memory เท่านั้น — refresh page หาย (ดู Roadmap → Firebase Storage)
 - **Browser support**: ทดสอบบน Chrome เท่านั้น (Safari/Firefox อาจมี audio quirks)
+- **Android phone side-tone**: บางรุ่น Chrome ตั้ง audio mode = COMMUNICATION → OS เปิด side-tone (เสียงตัวเอง echo ผ่าน earpiece/speaker) — **OS-level feature แก้จาก code ไม่ได้**. Workaround = ใส่หูฟัง 3.5mm/Bluetooth บนมือถือ
 
 ---
 
