@@ -161,17 +161,16 @@
       return;
     }
     // Remote stream:
-    //   - ถ้า expander active → element เสมอ muted (Web Audio handle playback) + opus mute ผ่าน expander gain
-    //   - ถ้า expander ปิด → fallback ตามเดิม (el.muted = _opusMuted)
-    if (_expanderActive) {
-      if (el.muted !== true) el.muted = true;
-      el.volume = 0;
-    } else {
-      el.muted = _opusMuted;
+    //   - element ไม่ muted (เก็บ AEC reference signal alive)
+    //   - ถ้า expander active → volume ถูก control โดย expander polling loop (อย่าแตะ)
+    //   - ถ้า expander OFF → volume ตาม _opusMuted
+    if (el.muted !== false) el.muted = false;
+    if (!_expanderActive) {
       el.volume = _opusMuted ? 0 : 1;
     }
+    // ถ้า opus muted ระหว่าง expander active → expander loop จะ set volume = 0 ให้เอง
     if (el.paused) {
-      el.play().catch(function(){});   // เก็บ playing เพื่อให้ MediaStreamSource (expander) ดึง audio ได้
+      el.play().catch(function(){});
     }
   }
 
@@ -204,12 +203,10 @@
 
   window.setOpusMuted = function (muted) {
     _opusMuted = muted;
-    // ถ้า expander active → ปรับ output gain ของ Web Audio chain (element ยัง muted เสมอ)
-    if (_expanderActive && _expOutputGain) {
-      _expOutputGain.gain.value = muted ? 0 : 1;
-    }
+    // Expander loop จะตั้ง volume = 0 ใน iteration ถัดไปถ้า _opusMuted true
+    // ถ้า expander OFF → _applyMuteToElement จะตั้ง volume ทันที
     _getMediaEls().forEach(_applyMuteToElement);
-    console.log('[Opus] muted=' + muted + (_expanderActive ? ' (via expander gain)' : ' (via element)'));
+    console.log('[Opus] muted=' + muted + (_expanderActive ? ' (expander will apply on next tick)' : ' (via element.volume)'));
   };
 
   // ============================================================
@@ -695,91 +692,106 @@
   }
 
   // ============================================================
-  // Soft Expander — receive-side echo suppression
-  //   remote audio → AnalyserNode → GainNode (variable) → destination
-  //   เสียงเบา (echo feedback ~-20dB) → gain ลด -20dB → -40dB รวม inaudible
-  //   เสียงปกติ (B speech) → gain เต็ม → ไม่กระทบ conversation
-  //   smooth attack 20ms (จับ onset) / release 150ms (no click)
+  // Local-mic VAD → duck remote element (anti self-echo)
+  //   Insight: receive-side analysis แยก "B's real speech" จาก "A's echo via B mic" ไม่ออก
+  //   (เพราะมี level ใกล้กัน). Local mic เป็น signal สะอาด → ใช้เป็น gating
+  //   A พูด → duck remote element → loop ขาดที่ A's playback → ไม่ได้ยินตัวเอง
+  //   A เงียบ 400ms hangover → restore volume → ได้ยิน B ปกติ
+  //   Element ไม่ muted → Chrome AEC reference intact (floor 0.1)
   // ============================================================
   var _expCtx = null;
   var _expSrc = null;
   var _expAnalyser = null;
-  var _expGain = null;             // expander gain (level-driven, attack/release smoothed)
-  var _expOutputGain = null;       // separate gain for setOpusMuted control
   var _expRemoteEl = null;
   var _expInterval = null;
-  var _expCurrentlyGated = false;  // ratelimited log state
+  var _expCurrentVol = 1.0;        // tracked locally — ramp toward target
+  var _expCurrentlyDucking = false; // ratelimited log state
   var _expLastLogMs = 0;
-  var _EXP_THRESHOLD = 18;         // 0-255 byte freq avg — speech > 25, echo feedback < 15
-  var _EXP_HIGH = 1.0;             // normal speech passes through
-  var _EXP_LOW = 0.1;              // -20dB attenuation for low-level (echo feedback)
-  var _EXP_ATTACK_TC = 0.020;      // setTargetAtTime time constant — 20ms attack
-  var _EXP_RELEASE_TC = 0.150;     // 150ms release
-  var _EXP_POLL_MS = 20;
+  // Local-mic-driven duck (tuning):
+  var _DUCK_THRESHOLD = 20;        // local mic byte freq avg — speech > 25-40, ambient < 10
+  var _DUCK_HIGH = 1.0;            // normal: B audible
+  var _DUCK_LOW = 0.1;             // ducking: -20dB while A speaks
+  var _DUCK_FLOOR = 0.1;           // never below — AEC reference alive
+  var _DUCK_HANGOVER_MS = 400;     // wait after A stops before restoring
+  var _DUCK_RAMP_DOWN = 0.10;      // fast duck (~160ms full transition)
+  var _DUCK_RAMP_UP = 0.05;        // gentle restore (~200ms full transition)
+  var _DUCK_POLL_MS = 20;
 
-  function _expAttachRemote() {
+  function _expAttachLocal() {
+    // 1. Find remote element สำหรับ control volume
     var remoteEl = _getMediaEls().find(function (el) {
       return el.srcObject && !_isLocalStreamEl(el);
     });
     if (!remoteEl) return false;
+    // 2. Find local audio track (tracked ใน _localAudioTracks)
+    var localTrack = null;
+    _localAudioTracks.forEach(function (t) {
+      if (!localTrack && t.readyState === 'live') localTrack = t;
+    });
+    if (!localTrack) return false;
+
     _expRemoteEl = remoteEl;
+    remoteEl.muted = false;
+    remoteEl.volume = _opusMuted ? 0 : 1;
+    _expCurrentVol = remoteEl.volume;
+    if (remoteEl.paused) remoteEl.play().catch(function(){});
+
     _expCtx = new (window.AudioContext || window.webkitAudioContext)();
-    _expSrc = _expCtx.createMediaStreamSource(remoteEl.srcObject);
+    var localStreamWrap = new MediaStream([localTrack]);
+    _expSrc = _expCtx.createMediaStreamSource(localStreamWrap);
     _expAnalyser = _expCtx.createAnalyser();
     _expAnalyser.fftSize = 256;
-    _expAnalyser.smoothingTimeConstant = 0.5;
-    _expGain = _expCtx.createGain();
-    _expGain.gain.value = _EXP_HIGH;
-    _expOutputGain = _expCtx.createGain();
-    _expOutputGain.gain.value = _opusMuted ? 0 : 1;
-
-    // chain: src → analyser → gain (level-driven) → outputGain (opus mute) → destination
+    _expAnalyser.smoothingTimeConstant = 0.3;
+    // Analyser only — no destination connection (no playback of mic to speaker)
     _expSrc.connect(_expAnalyser);
-    _expAnalyser.connect(_expGain);
-    _expGain.connect(_expOutputGain);
-    _expOutputGain.connect(_expCtx.destination);
 
-    // Now route playback through Web Audio → mute remote <audio> element
-    _expandSetRemoteElsMuted(true);
-    console.log('[Expander] attached to remote element (sampleRate=' + _expCtx.sampleRate + ')');
+    console.log('[Duck] attached — local mic VAD → remote element ducking (sampleRate=' + _expCtx.sampleRate + ')');
     return true;
-  }
-
-  function _expandSetRemoteElsMuted(muted) {
-    _getMediaEls().forEach(function (el) {
-      if (el.srcObject && !_isLocalStreamEl(el)) {
-        el.muted = muted;
-        if (muted) el.volume = 0;
-        if (el.paused) el.play().catch(function(){});
-      }
-    });
   }
 
   function _expStartPoll() {
     if (_expInterval) return;
     var data = new Uint8Array(_expAnalyser.frequencyBinCount);
+    var lastSpeechAt = 0;
     _expInterval = setInterval(function () {
-      if (!_expanderActive || !_expAnalyser) return;
+      if (!_expanderActive || !_expAnalyser || !_expRemoteEl) return;
+      // Opus mute = volume 0; ไม่ขับ duck
+      if (_opusMuted) {
+        if (_expRemoteEl.volume !== 0) _expRemoteEl.volume = 0;
+        return;
+      }
+      // Guard: element อาจ pause หลัง flutter_webrtc remount → resume
+      if (_expRemoteEl.paused) {
+        _expRemoteEl.play().catch(function(){});
+      }
       _expAnalyser.getByteFrequencyData(data);
       var sum = 0;
       for (var i = 0; i < data.length; i++) sum += data[i];
       var avg = sum / data.length;
-      var aboveThreshold = avg > _EXP_THRESHOLD;
-      var target = aboveThreshold ? _EXP_HIGH : _EXP_LOW;
-      var tc = (target > _expGain.gain.value) ? _EXP_ATTACK_TC : _EXP_RELEASE_TC;
-      _expGain.gain.setTargetAtTime(target, _expCtx.currentTime, tc / 3);
+      var now = Date.now();
+      if (avg > _DUCK_THRESHOLD) lastSpeechAt = now;
+      var aSpeaking = (now - lastSpeechAt) < _DUCK_HANGOVER_MS;
+      var target = aSpeaking ? _DUCK_LOW : _DUCK_HIGH;
+
+      var step = (target > _expCurrentVol) ? _DUCK_RAMP_UP : _DUCK_RAMP_DOWN;
+      if (Math.abs(target - _expCurrentVol) <= step) {
+        _expCurrentVol = target;
+      } else {
+        _expCurrentVol += (target > _expCurrentVol) ? step : -step;
+      }
+      if (_expCurrentVol < _DUCK_FLOOR) _expCurrentVol = _DUCK_FLOOR;
+      if (_expCurrentVol > 1) _expCurrentVol = 1;
+      _expRemoteEl.volume = _expCurrentVol;
 
       // ratelimit log on state changes
-      var gated = !aboveThreshold;
-      if (gated !== _expCurrentlyGated) {
-        _expCurrentlyGated = gated;
-        var now = Date.now();
+      if (aSpeaking !== _expCurrentlyDucking) {
+        _expCurrentlyDucking = aSpeaking;
         if (now - _expLastLogMs > 1000) {
           _expLastLogMs = now;
-          console.log('[Expander] ' + (gated ? 'gated (low level, suppressing echo)' : 'open (speech detected)') + ' avg=' + avg.toFixed(0));
+          console.log('[Duck] ' + (aSpeaking ? 'A speaking → ducking remote' : 'A silent → restoring') + ' avg=' + avg.toFixed(0) + ' vol=' + _expCurrentVol.toFixed(2));
         }
       }
-    }, _EXP_POLL_MS);
+    }, _DUCK_POLL_MS);
   }
 
   window.enableSoftExpander = function () {
@@ -788,30 +800,33 @@
     var attempts = 0;
     var tryAttach = function () {
       if (!_expanderActive) return;
-      if (_expAttachRemote()) {
+      if (_expAttachLocal()) {
         _expStartPoll();
       } else if (attempts++ < 20) {
         setTimeout(tryAttach, 500);
       } else {
-        console.warn('[Expander] giving up — no remote element after 10s');
+        console.warn('[Duck] giving up — no remote element OR local audio track after 10s');
         _expanderActive = false;
       }
     };
     tryAttach();
-    console.log('[Expander] ENABLED');
+    console.log('[Duck] ENABLED');
   };
 
   window.disableSoftExpander = function () {
     if (!_expanderActive) return;
     _expanderActive = false;
     if (_expInterval) { clearInterval(_expInterval); _expInterval = null; }
-    // Restore element playback (no Web Audio routing anymore)
-    _expandSetRemoteElsMuted(_opusMuted);
+    // Restore element to full volume (will respect _opusMuted via _applyMuteToElement)
+    if (_expRemoteEl) {
+      _expRemoteEl.volume = _opusMuted ? 0 : 1;
+    }
     if (_expCtx) { try { _expCtx.close(); } catch(_){} }
     _expCtx = null; _expSrc = null; _expAnalyser = null;
-    _expGain = null; _expOutputGain = null; _expRemoteEl = null;
-    _expCurrentlyGated = false;
-    console.log('[Expander] DISABLED');
+    _expRemoteEl = null;
+    _expCurrentVol = 1.0;
+    _expCurrentlyDucking = false;
+    console.log('[Duck] DISABLED');
   };
 
   // ============================================================
