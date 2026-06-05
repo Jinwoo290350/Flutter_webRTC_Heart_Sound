@@ -51,6 +51,13 @@ class WebRTCService extends ChangeNotifier {
     _peerConnection!.onIceCandidate = (candidate) {
       if (candidate.candidate == null) return;
       final role = _callState == CallState.calling ? 'caller' : 'callee';
+      // Diagnostic: log candidate type (host/srflx/relay) เพื่อ debug NAT/TURN
+      try {
+        final c = candidate.candidate!;
+        final typeMatch = RegExp(r'typ (host|srflx|prflx|relay)').firstMatch(c);
+        final type = typeMatch?.group(1) ?? 'unknown';
+        debugPrint('[ICE] local candidate gathered type=$type role=$role');
+      } catch (_) {}
       // ICE candidates อาจ fire ก่อน room ถูกสร้าง (race ระหว่าง gathering กับ createRoom)
       // → addIceCandidate ใน signaling จะ no-op ถ้า _roomRef ยัง null. wrap try/catch กัน flood
       try {
@@ -60,6 +67,10 @@ class WebRTCService extends ChangeNotifier {
       } catch (e) {
         debugPrint('WebRTCService: addIceCandidate sync error: $e');
       }
+    };
+
+    _peerConnection!.onIceGatheringState = (state) {
+      debugPrint('[ICE] gathering state: $state');
     };
 
     _peerConnection!.onIceConnectionState = (state) {
@@ -290,6 +301,9 @@ class WebRTCService extends ChangeNotifier {
         if (_peerConnection == null || _callState == CallState.ended) return;
         try {
           await _peerConnection!.addCandidate(candidate);
+          final c = candidate.candidate ?? '';
+          final typeMatch = RegExp(r'typ (host|srflx|prflx|relay)').firstMatch(c);
+          debugPrint('[ICE] remote candidate added type=${typeMatch?.group(1) ?? "?"}');
         } catch (e) {
           debugPrint('WebRTCService: addCandidate error: $e');
         }
@@ -349,6 +363,9 @@ class WebRTCService extends ChangeNotifier {
         if (_peerConnection == null || _callState == CallState.ended) return;
         try {
           await _peerConnection!.addCandidate(candidate);
+          final c = candidate.candidate ?? '';
+          final typeMatch = RegExp(r'typ (host|srflx|prflx|relay)').firstMatch(c);
+          debugPrint('[ICE] remote candidate added type=${typeMatch?.group(1) ?? "?"}');
         } catch (e) {
           debugPrint('WebRTCService: addCandidate error: $e');
         }
