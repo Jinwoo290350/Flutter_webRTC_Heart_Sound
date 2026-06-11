@@ -24,6 +24,11 @@ class SignalingService {
   DocumentReference? _roomRef;
   String? _roomId;
 
+  /// Buffer ICE candidates ที่ gather ก่อน _roomRef พร้อม (caller: candidate fire
+  /// ระหว่าง createRoom ยังทำ docRef.get() ค้างอยู่). flush หลัง _roomRef set
+  /// แทนที่จะทิ้ง — ไม่งั้น peer ไม่ได้รับ candidate → ICE ไม่เริ่ม checking
+  final List<MapEntry<RTCIceCandidate, String>> _pendingCandidates = [];
+
   /// เก็บ Firestore stream subscriptions ทั้งหมดเพื่อ cancel ใน reset()
   /// A5: Map keyed by listener name — ป้องกัน duplicate subscriptions
   final Map<String, StreamSubscription> _subs = {};
@@ -59,6 +64,7 @@ class SignalingService {
           FirebaseConfig.statusField: FirebaseConfig.statusWaiting,
           FirebaseConfig.createdAtField: FieldValue.serverTimestamp(),
         });
+        await _flushPendingCandidates(); // ส่ง candidate ที่ buffer ระหว่างรอ createRoom
         return code;
       } catch (e) {
         lastError = Exception('createRoom error: $e');
@@ -109,6 +115,8 @@ class SignalingService {
     final data = snapshot.data() as Map<String, dynamic>;
     if (!data.containsKey(FirebaseConfig.offerField)) return null;
 
+    await _flushPendingCandidates(); // เผื่อ candidate fire ก่อน joinRoom set _roomRef
+
     final offerData = data[FirebaseConfig.offerField];
     return RTCSessionDescription(offerData['sdp'], offerData['type']);
   }
@@ -129,8 +137,16 @@ class SignalingService {
   /// อัปโหลด ICE candidate ของตัวเองไปยัง Firestore
   /// [role]: 'caller' (patient) หรือ 'callee' (doctor)
   Future<void> addIceCandidate(RTCIceCandidate candidate, String role) async {
-    // ICE candidates อาจ gather เสร็จก่อน createRoom/joinRoom — ละเว้น (peer จะ generate ใหม่หลังจาก setRemoteDescription)
-    if (_roomRef == null) return;
+    // ICE candidates อาจ gather ก่อน createRoom/joinRoom set _roomRef เสร็จ
+    // → buffer ไว้ flush ทีหลัง (อย่าทิ้ง — ไม่งั้น peer ไม่ได้ candidate → ICE ค้าง)
+    if (_roomRef == null) {
+      _pendingCandidates.add(MapEntry(candidate, role));
+      return;
+    }
+    await _writeCandidate(candidate, role);
+  }
+
+  Future<void> _writeCandidate(RTCIceCandidate candidate, String role) async {
     await _roomRef!
         .collection('${role}_${FirebaseConfig.candidatesCollection}')
         .add({
@@ -138,6 +154,21 @@ class SignalingService {
       'sdpMid': candidate.sdpMid,
       'sdpMLineIndex': candidate.sdpMLineIndex,
     });
+  }
+
+  /// flush candidate ที่ buffer ไว้ก่อน _roomRef พร้อม — เรียกหลัง createRoom/joinRoom
+  Future<void> _flushPendingCandidates() async {
+    if (_roomRef == null || _pendingCandidates.isEmpty) return;
+    final pending = List.of(_pendingCandidates);
+    _pendingCandidates.clear();
+    debugPrint('[Signaling] flushing ${pending.length} buffered ICE candidates');
+    for (final entry in pending) {
+      try {
+        await _writeCandidate(entry.key, entry.value);
+      } catch (e) {
+        debugPrint('[Signaling] flush candidate error: $e');
+      }
+    }
   }
 
   /// รับ ICE candidates ของ peer จาก Firestore แบบ real-time
@@ -220,6 +251,7 @@ class SignalingService {
   void reset() {
     for (final s in _subs.values) { s.cancel(); }
     _subs.clear();
+    _pendingCandidates.clear();
     _roomRef = null;
     _roomId = null;
   }
