@@ -240,23 +240,31 @@
     "registerProcessor('steth-capture', StethCapture);"
   ].join('\n');
 
-  // Playback worklet — ring buffer pull-mode
-  // กำจัด BufferSource scheduling drift บน Android: audio thread pull samples on-demand
-  // จาก ring (32000 samples = 2s @ 16kHz). Underrun = output silence, ไม่ crash.
-  // Pre-fill threshold (320ms PC / 640ms Android) ก่อนเริ่มเล่น → buffer headroom
+  // Playback worklet — ring buffer pull-mode (4s ring @ 16kHz)
+  //   audio thread pull samples on-demand → ไม่มี BufferSource scheduling drift
+  //   one-way heart sound → ยอม latency แลกความต่อเนื่อง:
+  //   - prefill ใหญ่ (800ms PC / 1000ms Android) absorb main-thread send jitter
+  //   - adaptive: underrun → ขยาย _minStart (+300ms cap 2s) → re-buffer cushion มากขึ้น
+  //   - drift trim: _available > _maxFill → drop oldest กัน latency creep + overflow corruption
   var _pcmPlaybackWorkletSrc = [
     "class StethPlayback extends AudioWorkletProcessor {",
     "  constructor() {",
     "    super();",
-    "    this._size = 32000;",
+    "    this._size = 64000;",                 // 4s @ 16kHz
     "    this._ring = new Float32Array(this._size);",
     "    this._write = 0; this._read = 0; this._available = 0;",
-    "    this._minStart = 5120;",   // default 320ms prefill
+    "    this._minStart = 12800;",             // default 800ms prefill (overridden by config)
+    "    this._maxFill = 60800;",              // overflow guard ~3.8s (overridden by config)
     "    this._playing = false;",
     "    this._underruns = 0;",
+    "    this._trims = 0;",
     "    this.port.onmessage = (e) => {",
     "      var d = e.data;",
-    "      if (d && d.cmd === 'config') { this._minStart = d.prefill; return; }",
+    "      if (d && d.cmd === 'config') {",
+    "        this._minStart = d.prefill;",
+    "        this._maxFill = d.maxFill;",
+    "        return;",
+    "      }",
     "      if (d && d.cmd === 'reset') {",
     "        this._write = 0; this._read = 0; this._available = 0;",
     "        this._playing = false; return;",
@@ -266,7 +274,14 @@
     "        this._ring[this._write] = chunk[i];",
     "        this._write = (this._write + 1) % this._size;",
     "      }",
-    "      this._available = Math.min(this._available + chunk.length, this._size);",
+    "      this._available += chunk.length;",
+    "      if (this._available > this._maxFill) {",   // overflow guard เท่านั้น (ใกล้ ring เต็ม)
+    "        var drop = this._available - this._maxFill;",
+    "        this._read = (this._read + drop) % this._size;",
+    "        this._available = this._maxFill;",
+    "        this._trims++;",
+    "        this.port.postMessage({ event: 'trim', count: this._trims, dropped: drop });",
+    "      }",
     "    };",
     "  }",
     "  process(inputs, outputs) {",
@@ -283,10 +298,11 @@
     "        this._available--;",
     "      } else {",
     "        out[i] = 0;",
-    "        this._playing = false;",   // wait for refill
+    "        this._playing = false;",           // wait for refill
     "        this._underruns++;",
+    "        this._minStart = Math.min(this._minStart + 4800, 32000);",  // grow cushion +300ms cap 2s
     "        if (this._underruns % 50 === 1) {",
-    "          this.port.postMessage({ event: 'underrun', count: this._underruns });",
+    "          this.port.postMessage({ event: 'underrun', count: this._underruns, minStart: this._minStart });",
     "        }",
     "      }",
     "    }",
@@ -533,11 +549,18 @@
     URL.revokeObjectURL(blobUrl);
 
     _pcmWorkletNode = new AudioWorkletNode(_pcmPlayCtx, 'steth-playback');
-    var prefillSamples = IS_ANDROID ? 10240 : 5120;   // 640ms vs 320ms @ 16kHz
-    _pcmWorkletNode.port.postMessage({ cmd: 'config', prefill: prefillSamples });
+    // one-way heart sound → prefill ใหญ่ absorb main-thread send jitter (latency รับได้)
+    var prefillSamples = IS_ANDROID ? 16000 : 12800;   // 1000ms vs 800ms @ 16kHz
+    var maxFillSamples = 60800;                          // ~3.8s overflow guard เท่านั้น (ไม่ trim ปกติ)
+    _pcmWorkletNode.port.postMessage({ cmd: 'config', prefill: prefillSamples, maxFill: maxFillSamples });
     _pcmWorkletNode.port.onmessage = function (e) {
-      if (e.data && e.data.event === 'underrun') {
-        console.log('[PCM] underrun #' + e.data.count + ' (worklet ring empty)');
+      if (!e.data) return;
+      if (e.data.event === 'underrun') {
+        console.log('[PCM] underrun #' + e.data.count + ' → grew prefill to ' +
+                    ((e.data.minStart || 0) / 16).toFixed(0) + 'ms');
+      } else if (e.data.event === 'trim') {
+        console.log('[PCM] TRIM #' + e.data.count + ' dropped ' +
+                    ((e.data.dropped || 0) / 16).toFixed(0) + 'ms (buffer overflow — drift/burst)');
       }
     };
 
