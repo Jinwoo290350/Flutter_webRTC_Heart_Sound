@@ -37,6 +37,9 @@
       50% { opacity: 0.65; }
     }
   </style>
+  <!-- FLAC lossless codec (libflac.js WASM) — vendored local for offline reliability.
+       Exposes global Flac; fetches libflac.min.wasm.wasm relative to page. -->
+  <script src="libflac.wasm.js"></script>
 </head>
 <body>
   <div id="audio-unlock-overlay">🔊 แตะที่นี่เพื่อเปิดเสียง</div>
@@ -322,6 +325,69 @@
     return i16;
   }
 
+  // ============================================================
+  // FLAC lossless compression (libflac.js) — ลด 256 kbps → ~60 kbps
+  //   patient encode → DataChannel (message-framed: 1 emission = 1 message)
+  //   doctor decode → ring buffer. Fallback raw Int16 ถ้า lib ไม่พร้อม
+  // ============================================================
+  var _flacReady = false;
+  var _flacEnc = 0;                    // encoder id (0 = none → raw fallback)
+  var _FLAC_COMPRESSION = 5;           // 0-8; 5 = balanced
+  (function () {
+    if (typeof Flac === 'undefined') { console.warn('[FLAC] lib not loaded → raw PCM'); return; }
+    if (Flac.isReady && Flac.isReady()) { _flacReady = true; console.log('[FLAC] lib ready'); }
+    else if (Flac.on) Flac.on('ready', function () { _flacReady = true; console.log('[FLAC] lib ready'); });
+  })();
+
+  // start encoder for a new stream — write_cb ส่ง frame bytes ทันที (header ก่อน)
+  function _flacEncStart() {
+    if (!_flacReady || typeof Flac === 'undefined') return false;
+    try {
+      _flacEnc = Flac.create_libflac_encoder(16000, 1, 16, _FLAC_COMPRESSION, 0, false);
+      if (!_flacEnc) { console.warn('[FLAC] encoder create failed → raw'); _flacEnc = 0; return false; }
+      var initStatus = Flac.init_encoder_stream(_flacEnc, function (buf, bytes) {
+        if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
+        try {
+          // copy view → standalone ArrayBuffer (WASM heap reused after return)
+          _pcmSendChannel.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + bytes));
+        } catch (err) { console.error('[FLAC] send error:', err); }
+      });
+      if (initStatus !== 0) {
+        console.warn('[FLAC] init failed status=' + initStatus + ' → raw');
+        try { Flac.FLAC__stream_encoder_delete(_flacEnc); } catch(_){}
+        _flacEnc = 0; return false;
+      }
+      console.log('[FLAC] encoder started (16kHz mono, compression=' + _FLAC_COMPRESSION + ')');
+      return true;
+    } catch (e) { console.error('[FLAC] encStart error:', e); _flacEnc = 0; return false; }
+  }
+
+  function _flacEncStop() {
+    if (_flacEnc) {
+      try { Flac.FLAC__stream_encoder_finish(_flacEnc); } catch(_){}
+      try { Flac.FLAC__stream_encoder_delete(_flacEnc); } catch(_){}
+      _flacEnc = 0;
+    }
+  }
+
+  // shared chunk sender — FLAC if encoder active, else raw Int16
+  function _sendPcmChunk(f32) {
+    if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
+    if (_flacEnc) {
+      var n = f32.length;
+      var i32 = new Int32Array(n);     // libFLAC wants 32-bit samples (16-bit range)
+      for (var i = 0; i < n; i++) {
+        var s = f32[i] < -1 ? -1 : (f32[i] > 1 ? 1 : f32[i]);
+        i32[i] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7FFF);
+      }
+      try { Flac.FLAC__stream_encoder_process_interleaved(_flacEnc, i32, n); }
+      catch (e) { console.error('[FLAC] encode error:', e); }
+    } else {
+      var i16 = _floatToInt16(f32);
+      try { _pcmSendChannel.send(i16.buffer); } catch (e) { console.error('[PCM] send error:', e); }
+    }
+  }
+
   window.startSimAudio = async function (assetPath) {
     try {
       // Stop previous if any
@@ -361,17 +427,11 @@
       var pcmNode = new AudioWorkletNode(ctx, 'steth-capture');
       var _sendCount = 0;
       pcmNode.port.onmessage = function (e) {
-        if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
         var f32 = new Float32Array(e.data);
-        var i16 = _floatToInt16(f32);
-        try {
-          _pcmSendChannel.send(i16.buffer);
-          _sendCount++;
-          if (_sendCount === 1 || _sendCount % 500 === 0) {
-            console.log('[PCM] send #' + _sendCount);
-          }
-        } catch (err) {
-          console.error('[PCM] send error:', err);
+        _sendPcmChunk(f32);
+        _sendCount++;
+        if (_sendCount === 1 || _sendCount % 500 === 0) {
+          console.log('[PCM] send #' + _sendCount + (_flacEnc ? ' (flac)' : ' (raw)'));
         }
       };
 
@@ -382,6 +442,7 @@
       pcmNode.connect(muteGain);
       muteGain.connect(ctx.destination);
 
+      _flacEncStart();   // start fresh FLAC stream (sends header) — noop if lib unavailable
       src.start();
       _simCtx = ctx;
       _simSrc = src;
@@ -393,6 +454,7 @@
 
   window.stopSimAudio = async function () {
     try {
+      _flacEncStop();   // flush + delete FLAC encoder
       if (_simSrc) { try { _simSrc.stop(); } catch(_){} _simSrc = null; }
       if (_simCtx) { try { await _simCtx.close(); } catch(_){} _simCtx = null; }
       console.log('[SimAudio] stopped');
@@ -444,17 +506,11 @@
       var pcmNode = new AudioWorkletNode(ctx, 'steth-capture');
       var _sendCount = 0;
       pcmNode.port.onmessage = function (e) {
-        if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
         var f32 = new Float32Array(e.data);
-        var i16 = _floatToInt16(f32);
-        try {
-          _pcmSendChannel.send(i16.buffer);
-          _sendCount++;
-          if (_sendCount === 1 || _sendCount % 500 === 0) {
-            console.log('[StethMic] send #' + _sendCount);
-          }
-        } catch (err) {
-          console.error('[StethMic] send error:', err);
+        _sendPcmChunk(f32);
+        _sendCount++;
+        if (_sendCount === 1 || _sendCount % 500 === 0) {
+          console.log('[StethMic] send #' + _sendCount + (_flacEnc ? ' (flac)' : ' (raw)'));
         }
       };
 
@@ -464,9 +520,10 @@
       pcmNode.connect(muteGain);
       muteGain.connect(ctx.destination);
 
+      _flacEncStart();   // fresh FLAC stream
       _stethCtx = ctx;
       _stethStream = stream;
-      console.log('[StethMic] started (filters OFF, 48kHz)');
+      console.log('[StethMic] started (filters OFF)');
     } catch (e) {
       console.error('[StethMic] error:', e);
       throw e;
@@ -475,6 +532,7 @@
 
   window.stopStethMic = async function () {
     try {
+      _flacEncStop();
       if (_stethCtx) { try { await _stethCtx.close(); } catch(_){} _stethCtx = null; }
       if (_stethStream) {
         _stethStream.getTracks().forEach(function (t) { t.stop(); });
@@ -503,25 +561,103 @@
   var _pcmMuted = false;
   var _bassBoostEnabled = false;
 
+  // FLAC decoder state (doctor) — auto-detect FLAC vs raw via "fLaC" stream marker
+  var _flacDec = 0;
+  var _flacInQueue = [];              // pending input byte chunks (1 per DC message)
+  var _flacInOff = 0;                 // read offset into _flacInQueue[0]
+  var _flacMode = null;              // null | 'flac' | 'raw'
+  var _flacDecFrames = 0;            // decoded-frame counter (diagnostic)
+
+  function _feedToWorklet(f32) {
+    if (_pcmWorkletReady && _pcmWorkletNode) _pcmWorkletNode.port.postMessage(f32);
+    else _pcmPending.push(f32);
+  }
+
+  function _flacDecStop() {
+    if (_flacDec) { try { Flac.FLAC__stream_decoder_delete(_flacDec); } catch(_){} _flacDec = 0; }
+    _flacInQueue = []; _flacInOff = 0;
+  }
+
+  function _flacDecStart() {
+    if (!_flacReady || typeof Flac === 'undefined') return false;
+    try {
+      _flacDec = Flac.create_libflac_decoder(false);
+      if (!_flacDec) { console.warn('[FLAC] decoder create failed'); _flacDec = 0; return false; }
+      var initStatus = Flac.init_decoder_stream(_flacDec,
+        function read_cb(maxBytes) {                 // serve queued FLAC bytes
+          if (_flacInQueue.length === 0) return { buffer: undefined, readDataLength: 0, error: false };
+          var head = _flacInQueue[0];
+          var take = Math.min(head.length - _flacInOff, maxBytes);
+          var out = head.subarray(_flacInOff, _flacInOff + take);
+          _flacInOff += take;
+          if (_flacInOff >= head.length) { _flacInQueue.shift(); _flacInOff = 0; }
+          return { buffer: out, readDataLength: take, error: false };
+        },
+        function write_cb(channelData) {             // channelData = [ch0_Uint8Array, ...] (per channel)
+          var ch0 = channelData && channelData[0];   // mono — 16-bit LE bytes
+          if (!ch0 || ch0.byteLength < 2) return;
+          var i16 = new Int16Array(ch0.buffer, ch0.byteOffset, ch0.byteLength >> 1);
+          var f32 = new Float32Array(i16.length);
+          for (var i = 0; i < i16.length; i++) f32[i] = i16[i] < 0 ? i16[i] / 0x8000 : i16[i] / 0x7FFF;
+          _feedToWorklet(f32);
+          _flacDecFrames++;
+          if (_flacDecFrames === 1 || _flacDecFrames % 200 === 0) console.log('[FLAC] decoded frame #' + _flacDecFrames + ' (' + i16.length + ' samples)');
+        },
+        function err_cb(code, msg) { console.warn('[FLAC] decode error:', code, msg); },
+        function meta_cb(m) { if (m) console.log('[FLAC] decoder meta ' + (m.sampleRate || '?') + 'Hz ' + (m.channels || '?') + 'ch'); }
+      );
+      if (initStatus !== 0) { console.warn('[FLAC] decoder init failed ' + initStatus); _flacDecStop(); return false; }
+      console.log('[FLAC] decoder started');
+      return true;
+    } catch (e) { console.error('[FLAC] decStart error:', e); _flacDec = 0; return false; }
+  }
+
   window._startPcmPlayback = async function (dc) {
     // Register DC listener FIRST — กัน race ระหว่าง await audioWorklet.addModule
     dc.binaryType = 'arraybuffer';
     var _msgCount = 0;
     dc.addEventListener('message', function (e) {
       _msgCount++;
-      if (_msgCount === 1 || _msgCount % 500 === 0) console.log('[PCM] recv #' + _msgCount);
-      var i16 = new Int16Array(e.data);
-      var f32 = new Float32Array(i16.length);
-      for (var i = 0; i < i16.length; i++) {
-        f32[i] = i16[i] < 0 ? i16[i] / 0x8000 : i16[i] / 0x7FFF;
+      var u8 = new Uint8Array(e.data);
+      // detect new FLAC stream: payload begins with "fLaC" (0x66 4C 61 43)
+      var isHeader = u8.length >= 4 && u8[0] === 0x66 && u8[1] === 0x4C && u8[2] === 0x61 && u8[3] === 0x43;
+      if (isHeader) {
+        _flacDecStop();
+        _flacDecFrames = 0;
+        if (_pcmWorkletNode) { try { _pcmWorkletNode.port.postMessage({ cmd: 'reset' }); } catch(_){} }
+        _flacMode = _flacDecStart() ? 'flac' : 'raw';
+      } else if (_flacMode === null) {
+        _flacMode = 'raw';   // first message not a FLAC header → raw Int16 stream
       }
-      if (_pcmWorkletReady && _pcmWorkletNode) {
-        _pcmWorkletNode.port.postMessage(f32);
+
+      if (_flacMode === 'flac' && _flacDec) {
+        _flacInQueue.push(u8);
+        // 1-message lookahead: process only while ≥2 chunks queued, keeping the latest
+        // as lookahead → read_cb never hits empty mid-unit (no false END_OF_STREAM).
+        // Each DataChannel message = 1 encoder emission (metadata block or frame).
+        var guard = 0;
+        while (_flacInQueue.length >= 2 && guard++ < 128) {
+          var beforeLen = _flacInQueue.length, beforeOff = _flacInOff;
+          var ok = Flac.FLAC__stream_decoder_process_single(_flacDec);
+          var st = Flac.FLAC__stream_decoder_get_state(_flacDec);
+          if (!ok || st >= 4) {   // 4=END_OF_STREAM, >4=error → resync decoder
+            if (_msgCount < 20) console.warn('[FLAC] decoder state=' + st + ' ok=' + ok + ' → resync');
+            _flacDecStop(); _flacDecStart(); _flacMode = 'flac'; break;
+          }
+          if (_flacInQueue.length === beforeLen && _flacInOff === beforeOff) break; // no progress
+        }
       } else {
-        _pcmPending.push(f32);
+        // raw Int16 path
+        var i16 = new Int16Array(e.data);
+        var f32 = new Float32Array(i16.length);
+        for (var k = 0; k < i16.length; k++) f32[k] = i16[k] < 0 ? i16[k] / 0x8000 : i16[k] / 0x7FFF;
+        _feedToWorklet(f32);
       }
+      if (_msgCount === 1 || _msgCount % 500 === 0) console.log('[PCM] recv #' + _msgCount + ' mode=' + _flacMode);
     });
     dc.addEventListener('close', function () {
+      _flacDecStop();
+      _flacMode = null;
       if (_pcmWorkletNode) {
         try { _pcmWorkletNode.port.postMessage({ cmd: 'reset' }); } catch(_){}
       }
