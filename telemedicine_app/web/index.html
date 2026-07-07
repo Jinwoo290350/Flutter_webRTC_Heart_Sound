@@ -253,14 +253,19 @@
     "class StethPlayback extends AudioWorkletProcessor {",
     "  constructor() {",
     "    super();",
-    "    this._size = 64000;",                 // 4s @ 16kHz
+    "    this._size = 96000;",                 // 6s @ 16kHz — รองรับ stall + ceiling ใหญ่
     "    this._ring = new Float32Array(this._size);",
     "    this._write = 0; this._read = 0; this._available = 0;",
-    "    this._minStart = 12800;",             // default 800ms prefill (overridden by config)
-    "    this._maxFill = 60800;",              // overflow guard ~3.8s (overridden by config)
+    "    this._minStart = 24000;",             // default 1500ms prefill (overridden by config)
+    "    this._maxFill = 88000;",              // overflow guard ~5.5s (overridden by config)
     "    this._playing = false;",
     "    this._underruns = 0;",
     "    this._trims = 0;",
+    "    this._procCalls = 0;",
+    "    this._lastSample = 0;",               // click-free: fade from/to this
+    "    this._fadeGain = 0;",                 // 0..1 ramp — กัน discontinuity click ตอน underrun/resume
+    "    this._FADE_OUT = 0.015625;",          // 1/64 ≈ 4ms fade-out
+    "    this._FADE_IN = 0.0078125;",          // 1/128 ≈ 8ms fade-in
     "    this.port.onmessage = (e) => {",
     "      var d = e.data;",
     "      if (d && d.cmd === 'config') {",
@@ -270,7 +275,7 @@
     "      }",
     "      if (d && d.cmd === 'reset') {",
     "        this._write = 0; this._read = 0; this._available = 0;",
-    "        this._playing = false; return;",
+    "        this._playing = false; this._fadeGain = 0; this._lastSample = 0; return;",
     "      }",
     "      var chunk = d;",
     "      for (var i = 0; i < chunk.length; i++) {",
@@ -290,26 +295,35 @@
     "  process(inputs, outputs) {",
     "    var out = outputs[0][0];",
     "    if (!out) return true;",
-    "    if (!this._playing) {",
-    "      if (this._available >= this._minStart) this._playing = true;",
-    "      else { out.fill(0); return true; }",
+    "    var n = out.length, i;",
+    "    if (!this._playing) {",                // ยัง prefill ไม่ถึง → fade-out เงียบ (ไม่ hard-zero = ไม่ click)
+    "      if (this._available >= this._minStart) { this._playing = true; }",
+    "      else {",
+    "        for (i = 0; i < n; i++) { this._fadeGain = Math.max(0, this._fadeGain - this._FADE_OUT); out[i] = this._lastSample * this._fadeGain; }",
+    "        this._report(); return true;",
+    "      }",
     "    }",
-    "    for (var i = 0; i < out.length; i++) {",
+    "    for (i = 0; i < n; i++) {",
     "      if (this._available > 0) {",
-    "        out[i] = this._ring[this._read];",
-    "        this._read = (this._read + 1) % this._size;",
-    "        this._available--;",
-    "      } else {",
-    "        out[i] = 0;",
-    "        this._playing = false;",           // wait for refill
-    "        this._underruns++;",
-    "        this._minStart = Math.min(this._minStart + 4800, 32000);",  // grow cushion +300ms cap 2s
-    "        if (this._underruns % 50 === 1) {",
-    "          this.port.postMessage({ event: 'underrun', count: this._underruns, minStart: this._minStart });",
+    "        var s = this._ring[this._read];",
+    "        this._read = (this._read + 1) % this._size; this._available--;",
+    "        this._fadeGain = Math.min(1, this._fadeGain + this._FADE_IN);",  // fade-in ตอน resume
+    "        out[i] = s * this._fadeGain; this._lastSample = s;",
+    "      } else {",                          // ran dry → underrun: fade-out จาก last sample (ไม่ click)
+    "        this._fadeGain = Math.max(0, this._fadeGain - this._FADE_OUT);",
+    "        out[i] = this._lastSample * this._fadeGain;",
+    "        if (this._playing) {",
+    "          this._playing = false; this._underruns++;",
+    "          this._minStart = Math.min(this._minStart + 4800, 48000);",  // grow cushion +300ms cap 3s
+    "          if (this._underruns % 50 === 1) this.port.postMessage({ event: 'underrun', count: this._underruns, minStart: this._minStart });",
     "        }",
     "      }",
     "    }",
-    "    return true;",
+    "    this._report(); return true;",
+    "  }",
+    "  _report() {",
+    "    this._procCalls++;",                    // ~125 calls/s @16kHz → level report ทุก ~1s
+    "    if (this._procCalls % 125 === 0) this.port.postMessage({ event: 'level', availMs: (this._available / 16) | 0, trims: this._trims, underruns: this._underruns });",
     "  }",
     "}",
     "registerProcessor('steth-playback', StethPlayback);"
@@ -332,25 +346,56 @@
   // ============================================================
   var _flacReady = false;
   var _flacEnc = 0;                    // encoder id (0 = none → raw fallback)
+  var _flacDisabled = false;           // A/B: setFlacEnabled(false) → force raw PCM (compare CPU/quality)
   var _FLAC_COMPRESSION = 5;           // 0-8; 5 = balanced
+  // A/B test toggle — patient side; ต้อง stop→play heart sound ใหม่ให้ effect
+  window.setFlacEnabled = function (on) {
+    _flacDisabled = !on;
+    console.log('[FLAC] ' + (on ? 'ENABLED' : 'DISABLED → raw PCM') + ' (replay heart sound to apply)');
+  };
+
+  // ---- Diagnostic framing: [u32 seq][u32 checksum][payload] per DC message ----
+  //   แยกสาเหตุกระตุก: seq gap = message หาย / checksum ผิด = เพี้ยน / ครบแต่ late = ส่งไม่ทัน
+  var _pcmSeq = 0;
+  window._pcmDebug = false;            // ตั้ง true ใน console เพื่อดู diagnostic (buffer/seq/arrival) — default OFF ลด main-thread stall
+  function _fnv1a(u8) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < u8.length; i++) { h ^= u8[i]; h = (h * 0x01000193) >>> 0; }
+    return h >>> 0;
+  }
+  function _dcSendSeq(payloadBuf) {
+    if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
+    var payload = new Uint8Array(payloadBuf);
+    var out = new Uint8Array(8 + payload.length);
+    var dv = new DataView(out.buffer);
+    dv.setUint32(0, _pcmSeq >>> 0, true);
+    dv.setUint32(4, _fnv1a(payload), true);
+    out.set(payload, 8);
+    try {
+      _pcmSendChannel.send(out.buffer);
+      _pcmSeq++;
+      if (window._pcmDebug && _pcmSeq % 200 === 0) {
+        console.log('[DC] sent seq=' + _pcmSeq + ' bufferedAmount=' + _pcmSendChannel.bufferedAmount + 'B');
+      }
+    } catch (e) { console.error('[DC] send error seq=' + _pcmSeq + ':', e); }
+  }
   (function () {
     if (typeof Flac === 'undefined') { console.warn('[FLAC] lib not loaded → raw PCM'); return; }
-    if (Flac.isReady && Flac.isReady()) { _flacReady = true; console.log('[FLAC] lib ready'); }
-    else if (Flac.on) Flac.on('ready', function () { _flacReady = true; console.log('[FLAC] lib ready'); });
+    function onReady() { _flacReady = true; console.log('[FLAC] lib ready'); }
+    if (Flac.isReady && Flac.isReady()) onReady();
+    else if (Flac.on) Flac.on('ready', onReady);
   })();
 
   // start encoder for a new stream — write_cb ส่ง frame bytes ทันที (header ก่อน)
   function _flacEncStart() {
+    if (_flacDisabled) { console.log('[FLAC] disabled → sending raw PCM'); return false; }
     if (!_flacReady || typeof Flac === 'undefined') return false;
     try {
       _flacEnc = Flac.create_libflac_encoder(16000, 1, 16, _FLAC_COMPRESSION, 0, false);
       if (!_flacEnc) { console.warn('[FLAC] encoder create failed → raw'); _flacEnc = 0; return false; }
       var initStatus = Flac.init_encoder_stream(_flacEnc, function (buf, bytes) {
-        if (!_pcmSendChannel || _pcmSendChannel.readyState !== 'open') return;
-        try {
-          // copy view → standalone ArrayBuffer (WASM heap reused after return)
-          _pcmSendChannel.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + bytes));
-        } catch (err) { console.error('[FLAC] send error:', err); }
+        // copy view → standalone ArrayBuffer (WASM heap reused after return) + seq/checksum wrap
+        _dcSendSeq(buf.buffer.slice(buf.byteOffset, buf.byteOffset + bytes));
       });
       if (initStatus !== 0) {
         console.warn('[FLAC] init failed status=' + initStatus + ' → raw');
@@ -384,7 +429,7 @@
       catch (e) { console.error('[FLAC] encode error:', e); }
     } else {
       var i16 = _floatToInt16(f32);
-      try { _pcmSendChannel.send(i16.buffer); } catch (e) { console.error('[PCM] send error:', e); }
+      _dcSendSeq(i16.buffer);
     }
   }
 
@@ -430,7 +475,7 @@
         var f32 = new Float32Array(e.data);
         _sendPcmChunk(f32);
         _sendCount++;
-        if (_sendCount === 1 || _sendCount % 500 === 0) {
+        if (window._pcmDebug && (_sendCount === 1 || _sendCount % 500 === 0)) {
           console.log('[PCM] send #' + _sendCount + (_flacEnc ? ' (flac)' : ' (raw)'));
         }
       };
@@ -442,6 +487,7 @@
       pcmNode.connect(muteGain);
       muteGain.connect(ctx.destination);
 
+      _pcmSeq = 0;       // reset diagnostic seq for new stream
       _flacEncStart();   // start fresh FLAC stream (sends header) — noop if lib unavailable
       src.start();
       _simCtx = ctx;
@@ -509,7 +555,7 @@
         var f32 = new Float32Array(e.data);
         _sendPcmChunk(f32);
         _sendCount++;
-        if (_sendCount === 1 || _sendCount % 500 === 0) {
+        if (window._pcmDebug && (_sendCount === 1 || _sendCount % 500 === 0)) {
           console.log('[StethMic] send #' + _sendCount + (_flacEnc ? ' (flac)' : ' (raw)'));
         }
       };
@@ -520,6 +566,7 @@
       pcmNode.connect(muteGain);
       muteGain.connect(ctx.destination);
 
+      _pcmSeq = 0;       // reset diagnostic seq for new stream
       _flacEncStart();   // fresh FLAC stream
       _stethCtx = ctx;
       _stethStream = stream;
@@ -555,6 +602,7 @@
   var _pcmPlayCtx = null;
   var _pcmMasterGain = null;
   var _pcmBassFilter = null;
+  var _pcmLimiter = null;
   var _pcmWorkletNode = null;
   var _pcmWorkletReady = false;
   var _pcmPending = [];               // f32 chunks buffered during async worklet load
@@ -567,6 +615,13 @@
   var _flacInOff = 0;                 // read offset into _flacInQueue[0]
   var _flacMode = null;              // null | 'flac' | 'raw'
   var _flacDecFrames = 0;            // decoded-frame counter (diagnostic)
+  // ---- Receiver diagnostics: seq continuity + checksum + arrival timing ----
+  var _pcmExpectSeq = -1;
+  var _pcmGapTotal = 0;              // cumulative missing messages
+  var _pcmBadChecksum = 0;
+  var _pcmLastArrival = 0;
+  var _pcmLevelLast = 0;            // last buffer-level report time (decode-rate calc)
+  var _pcmLevelFrames = 0;
 
   function _feedToWorklet(f32) {
     if (_pcmWorkletReady && _pcmWorkletNode) _pcmWorkletNode.port.postMessage(f32);
@@ -601,7 +656,7 @@
           for (var i = 0; i < i16.length; i++) f32[i] = i16[i] < 0 ? i16[i] / 0x8000 : i16[i] / 0x7FFF;
           _feedToWorklet(f32);
           _flacDecFrames++;
-          if (_flacDecFrames === 1 || _flacDecFrames % 200 === 0) console.log('[FLAC] decoded frame #' + _flacDecFrames + ' (' + i16.length + ' samples)');
+          if (window._pcmDebug && (_flacDecFrames === 1 || _flacDecFrames % 200 === 0)) console.log('[FLAC] decoded frame #' + _flacDecFrames + ' (' + i16.length + ' samples)');
         },
         function err_cb(code, msg) { console.warn('[FLAC] decode error:', code, msg); },
         function meta_cb(m) { if (m) console.log('[FLAC] decoder meta ' + (m.sampleRate || '?') + 'Hz ' + (m.channels || '?') + 'ch'); }
@@ -618,9 +673,29 @@
     var _msgCount = 0;
     dc.addEventListener('message', function (e) {
       _msgCount++;
-      var u8 = new Uint8Array(e.data);
+      var full = new Uint8Array(e.data);
+      if (full.length < 8) { console.warn('[DC] runt message ' + full.length + 'B (no header) — skip'); return; }
+
+      // ---- Diagnostic header: [u32 seq][u32 checksum][payload] ----
+      var payload = full.subarray(8);      // strip [seq][checksum] header (always present)
+
+      // Diagnostic (gated — FNV/seq/timing = per-message main-thread work; off by default)
+      if (window._pcmDebug) {
+        var hdr = new DataView(full.buffer, full.byteOffset, full.byteLength);
+        var seq = hdr.getUint32(0, true), chk = hdr.getUint32(4, true);
+        if (_fnv1a(payload) !== chk) { _pcmBadChecksum++; console.warn('[DC] BAD checksum seq=' + seq + ' (total=' + _pcmBadChecksum + ')'); }
+        if (_pcmExpectSeq >= 0) {
+          if (seq > _pcmExpectSeq) { var missing = seq - _pcmExpectSeq; _pcmGapTotal += missing; console.warn('[DC] SEQ GAP: expected ' + _pcmExpectSeq + ' got ' + seq + ' (missing ' + missing + ', total=' + _pcmGapTotal + ')'); }
+          else if (seq < _pcmExpectSeq) { console.log('[DC] stream reset (replay)'); }
+        }
+        _pcmExpectSeq = seq + 1;
+        var now = performance.now();
+        if (_pcmLastArrival && (now - _pcmLastArrival) > 500) console.warn('[DC] arrival gap ' + (now - _pcmLastArrival).toFixed(0) + 'ms before seq=' + seq);
+        _pcmLastArrival = now;
+      }
+
       // detect new FLAC stream: payload begins with "fLaC" (0x66 4C 61 43)
-      var isHeader = u8.length >= 4 && u8[0] === 0x66 && u8[1] === 0x4C && u8[2] === 0x61 && u8[3] === 0x43;
+      var isHeader = payload.length >= 4 && payload[0] === 0x66 && payload[1] === 0x4C && payload[2] === 0x61 && payload[3] === 0x43;
       if (isHeader) {
         _flacDecStop();
         _flacDecFrames = 0;
@@ -631,7 +706,7 @@
       }
 
       if (_flacMode === 'flac' && _flacDec) {
-        _flacInQueue.push(u8);
+        _flacInQueue.push(payload);
         // 1-message lookahead: process only while ≥2 chunks queued, keeping the latest
         // as lookahead → read_cb never hits empty mid-unit (no false END_OF_STREAM).
         // Each DataChannel message = 1 encoder emission (metadata block or frame).
@@ -648,12 +723,15 @@
         }
       } else {
         // raw Int16 path
-        var i16 = new Int16Array(e.data);
+        var i16 = new Int16Array(payload.buffer, payload.byteOffset, payload.length >> 1);
         var f32 = new Float32Array(i16.length);
         for (var k = 0; k < i16.length; k++) f32[k] = i16[k] < 0 ? i16[k] / 0x8000 : i16[k] / 0x7FFF;
         _feedToWorklet(f32);
       }
-      if (_msgCount === 1 || _msgCount % 500 === 0) console.log('[PCM] recv #' + _msgCount + ' mode=' + _flacMode);
+      if (window._pcmDebug && (_msgCount === 1 || _msgCount % 500 === 0)) {
+        console.log('[PCM] recv #' + _msgCount + ' mode=' + _flacMode +
+                    ' lost=' + _pcmGapTotal + ' badChk=' + _pcmBadChecksum);
+      }
     });
     dc.addEventListener('close', function () {
       _flacDecStop();
@@ -685,18 +763,22 @@
     URL.revokeObjectURL(blobUrl);
 
     _pcmWorkletNode = new AudioWorkletNode(_pcmPlayCtx, 'steth-playback');
-    // one-way heart sound → prefill ใหญ่ absorb main-thread send jitter (latency รับได้)
-    var prefillSamples = IS_ANDROID ? 16000 : 12800;   // 1000ms vs 800ms @ 16kHz
-    var maxFillSamples = 60800;                          // ~3.8s overflow guard เท่านั้น (ไม่ trim ปกติ)
+    // one-way heart sound → prefill ใหญ่ absorb main-thread stall (1.5s) — latency รับได้
+    var prefillSamples = IS_ANDROID ? 28800 : 24000;   // 1800ms vs 1500ms @ 16kHz
+    var maxFillSamples = 88000;                          // ~5.5s overflow guard เท่านั้น (ไม่ trim ปกติ)
     _pcmWorkletNode.port.postMessage({ cmd: 'config', prefill: prefillSamples, maxFill: maxFillSamples });
     _pcmWorkletNode.port.onmessage = function (e) {
-      if (!e.data) return;
+      if (!e.data || !window._pcmDebug) return;   // diagnostic only
       if (e.data.event === 'underrun') {
-        console.log('[PCM] underrun #' + e.data.count + ' → grew prefill to ' +
-                    ((e.data.minStart || 0) / 16).toFixed(0) + 'ms');
+        console.log('[PCM] underrun #' + e.data.count + ' → grew prefill to ' + ((e.data.minStart || 0) / 16).toFixed(0) + 'ms');
       } else if (e.data.event === 'trim') {
-        console.log('[PCM] TRIM #' + e.data.count + ' dropped ' +
-                    ((e.data.dropped || 0) / 16).toFixed(0) + 'ms (buffer overflow — drift/burst)');
+        if (e.data.count % 10 === 1) console.log('[PCM] TRIM #' + e.data.count + ' dropped ' + ((e.data.dropped || 0) / 16).toFixed(0) + 'ms');
+      } else if (e.data.event === 'level') {
+        var now = performance.now();
+        var dt = _pcmLevelLast ? (now - _pcmLevelLast) / 1000 : 1;
+        var fps = ((_flacDecFrames - _pcmLevelFrames) / dt);
+        _pcmLevelLast = now; _pcmLevelFrames = _flacDecFrames;
+        console.log('[PCM] buffer=' + e.data.availMs + 'ms | decode=' + fps.toFixed(1) + ' fps | underruns=' + e.data.underruns);
       }
     };
 
@@ -706,9 +788,18 @@
     _pcmBassFilter.type = 'lowshelf';
     _pcmBassFilter.frequency.value = 200;
     _pcmBassFilter.gain.value = _bassBoostEnabled ? 6 : 0;
+    // Soft limiter — กัน +6dB bass boost clip (heart sound bass ดังอยู่แล้ว → +6dB เกิน 0dBFS = แตก)
+    // display-aid เท่านั้น (record tap ก่อน filter — ไม่กระทบสัญญาณที่บันทึก)
+    _pcmLimiter = _pcmPlayCtx.createDynamicsCompressor();
+    _pcmLimiter.threshold.value = -1;    // เริ่ม limit ที่ -1 dBFS
+    _pcmLimiter.knee.value = 0;
+    _pcmLimiter.ratio.value = 20;        // hard limit
+    _pcmLimiter.attack.value = 0.003;
+    _pcmLimiter.release.value = 0.1;
 
     _pcmWorkletNode.connect(_pcmBassFilter);
-    _pcmBassFilter.connect(_pcmMasterGain);
+    _pcmBassFilter.connect(_pcmLimiter);
+    _pcmLimiter.connect(_pcmMasterGain);
     if (!_pcmMuted) _pcmMasterGain.connect(_pcmPlayCtx.destination);
 
     _pcmWorkletReady = true;
