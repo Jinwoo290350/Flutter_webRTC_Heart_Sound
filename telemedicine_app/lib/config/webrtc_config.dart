@@ -6,25 +6,39 @@
 class WebRTCConfig {
   // ==================== ICE Servers ====================
 
-  /// STUN + TURN servers
-  /// ใช้ Open Relay Project (ฟรี ไม่ต้องสมัคร) สำหรับ hospital firewall traversal
-  /// TURN จำเป็นเมื่อ hospital block P2P direct connection
-  static const Map<String, dynamic> iceServers = {
-    'iceServers': [
+  /// TURN credentials — metered.ca (ฟรี 50GB/เดือน)
+  /// วิธีได้ค่า: สมัคร https://dashboard.metered.ca → TURN Server → copy
+  ///   Username + Credential มาวางตรงนี้ (URL ใช้ global.relay.metered.ca ได้เลย)
+  ///
+  /// ถ้าเว้นว่าง (ยังไม่สมัคร) → ใช้ STUN อย่างเดียว:
+  ///   - เน็ตเดียวกัน / NAT cone-type → ต่อได้ (host/srflx)
+  ///   - คนละเน็ต + NAT symmetric (มือถือ/carrier) → ต่อไม่ได้ (ต้องมี TURN relay)
+  static const String _turnUsername = String.fromEnvironment('TURN_USERNAME');
+  static const String _turnCredential = String.fromEnvironment('TURN_CREDENTIAL');
+
+  /// STUN + (TURN ถ้ามี credential) — assemble แบบ dynamic
+  static Map<String, dynamic> get iceServers {
+    final servers = <Map<String, dynamic>>[
+      // STUN (ฟรี ไม่ต้องสมัคร) — ได้ srflx candidate สำหรับ NAT traversal
       {'urls': 'stun:stun.l.google.com:19302'},
       {'urls': 'stun:stun1.l.google.com:19302'},
-      // Open Relay Project — public TURN, no signup needed
-      {
+      {'urls': 'stun:stun.cloudflare.com:3478'},
+    ];
+    // TURN relay — จำเป็นตอนคนละเน็ต + symmetric NAT (เพิ่มต่อเมื่อมี credential)
+    if (_turnUsername.isNotEmpty && _turnCredential.isNotEmpty) {
+      servers.add({
         'urls': [
-          'turn:openrelay.metered.ca:80',
-          'turn:openrelay.metered.ca:443',
-          'turns:openrelay.metered.ca:443', // ผ่าน HTTPS firewall ได้
+          'turn:global.relay.metered.ca:80',
+          'turn:global.relay.metered.ca:80?transport=tcp',
+          'turn:global.relay.metered.ca:443',
+          'turns:global.relay.metered.ca:443?transport=tcp', // ผ่าน HTTPS firewall
         ],
-        'username': 'openrelayproject',
-        'credential': 'openrelayproject',
-      },
-    ],
-  };
+        'username': _turnUsername,
+        'credential': _turnCredential,
+      });
+    }
+    return {'iceServers': servers};
+  }
 
   // ==================== Audio Constraints ====================
 

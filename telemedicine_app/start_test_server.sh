@@ -13,22 +13,19 @@ PORT=8080
 LOGFILE="/tmp/flutter-web-server.log"
 PIDFILE="/tmp/flutter-web-server.pid"
 
-FIREBASE_FLAGS=(
-  --dart-define=FIREBASE_WEB_API_KEY=AIzaSyDoQSEaodB21xGqdvpsLk1FvZuEcaBpSAA
-  --dart-define=FIREBASE_WEB_APP_ID=1:1062391658888:web:629df6f406f9f26aef223d
-  --dart-define=FIREBASE_WEB_MEASUREMENT_ID=G-E4TRT7B1VY
-  --dart-define=FIREBASE_MESSAGING_SENDER_ID=1062391658888
-  --dart-define=FIREBASE_PROJECT_ID=flutterwebrtcmtec
-  --dart-define=FIREBASE_AUTH_DOMAIN=flutterwebrtcmtec.firebaseapp.com
-  --dart-define=FIREBASE_STORAGE_BUCKET=flutterwebrtcmtec.firebasestorage.app
-)
+# Firebase + TURN config มาจาก .env (gitignored) — ไม่ commit secret ในสคริปต์
+# ต้องมีไฟล์ .env (copy จาก .env.example แล้วเติมค่า) ใน telemedicine_app/
+if [ ! -f .env ]; then
+  echo "❌ ไม่พบ .env — copy .env.example → .env แล้วเติมค่า Firebase/TURN"
+  exit 1
+fi
 
 cmd="${1:-start}"
 
 case "$cmd" in
   build)
     echo "🔨 Building Flutter web..."
-    flutter build web --release "${FIREBASE_FLAGS[@]}"
+    flutter build web --release --dart-define-from-file=.env
     echo "🔧 Cache-busting flutter_bootstrap.js + main.dart.js..."
     VERSION="$(date +%s)"
     # 1. ใน index.html: <script src="flutter_bootstrap.js"> → ?v=TIMESTAMP
