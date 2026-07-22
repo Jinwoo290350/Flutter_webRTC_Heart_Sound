@@ -292,8 +292,9 @@ class WebRTCService extends ChangeNotifier {
         _answerProcessed = true;
         try {
           await _peerConnection!.setRemoteDescription(answer);
+          debugPrint('[SDP] setRemoteDescription(answer) OK');
         } catch (e) {
-          debugPrint('WebRTCService: setRemoteDescription error: $e');
+          debugPrint('[SDP] setRemoteDescription(answer) FAILED: $e');
         }
       });
 
@@ -303,7 +304,9 @@ class WebRTCService extends ChangeNotifier {
           await _peerConnection!.addCandidate(candidate);
           final c = candidate.candidate ?? '';
           final typeMatch = RegExp(r'typ (host|srflx|prflx|relay)').firstMatch(c);
-          debugPrint('[ICE] remote candidate added type=${typeMatch?.group(1) ?? "?"}');
+          final isMdns = c.contains('.local');   // browser host candidates = mDNS .local
+          debugPrint('[ICE] remote candidate added type=${typeMatch?.group(1) ?? "?"}'
+              '${isMdns ? " MDNS(.local)" : ""}');
         } catch (e) {
           debugPrint('WebRTCService: addCandidate error: $e');
         }
@@ -346,7 +349,14 @@ class WebRTCService extends ChangeNotifier {
         _setError('ไม่พบ room: $roomId');
         return false;
       }
-      await _peerConnection!.setRemoteDescription(offer);
+      try {
+        await _peerConnection!.setRemoteDescription(offer);
+        debugPrint('[SDP] setRemoteDescription(offer) OK');
+      } catch (e) {
+        debugPrint('[SDP] setRemoteDescription(offer) FAILED: $e');
+        _setError('SDP offer ไม่ถูกต้อง: $e');
+        return false;
+      }
 
       final answer = await _peerConnection!.createAnswer({
         'offerToReceiveAudio': true,
@@ -365,7 +375,9 @@ class WebRTCService extends ChangeNotifier {
           await _peerConnection!.addCandidate(candidate);
           final c = candidate.candidate ?? '';
           final typeMatch = RegExp(r'typ (host|srflx|prflx|relay)').firstMatch(c);
-          debugPrint('[ICE] remote candidate added type=${typeMatch?.group(1) ?? "?"}');
+          final isMdns = c.contains('.local');   // browser host candidates = mDNS .local
+          debugPrint('[ICE] remote candidate added type=${typeMatch?.group(1) ?? "?"}'
+              '${isMdns ? " MDNS(.local)" : ""}');
         } catch (e) {
           debugPrint('WebRTCService: addCandidate error: $e');
         }

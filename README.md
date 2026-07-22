@@ -2,7 +2,8 @@
 
 ระบบ video call ระหว่างหมอกับคนไข้ พร้อมส่งเสียงหัวใจ (จาก stethoscope หรือ asset จำลอง) ผ่าน WebRTC แบบ real-time
 
-> **Status:** Web build ใช้งานได้ครบทุกฟีเจอร์หลัก (video call, voice, heart sound dual-mode, recording, mute controls). Native iOS/Android ยังไม่รองรับ heart sound features (ใช้ได้แค่ video call + voice)
+> **Status:** Web build ใช้งานได้ครบทุกฟีเจอร์หลัก (video call, voice, heart sound dual-mode, recording, mute controls).
+> **Android native**: video call + voice **ทำงานแล้ว** (android↔web ทดสอบผ่าน — SDP fix 2026-07) — heart sound features ยังเป็น web-only
 
 ---
 
@@ -70,6 +71,21 @@ cd telemedicine_app
 ```
 
 เปิด `http://localhost:8080` ใน Incognito 2 tab → tab 1 เป็น patient (เริ่มโทร) → copy room ID → tab 2 เป็น doctor (เข้าร่วม)
+
+**หมายเหตุ:** สคริปต์อ่าน secrets จาก `telemedicine_app/.env` (gitignored) — copy `.env.example` → `.env` แล้วเติมค่า Firebase (+ TURN ถ้ามี) ก่อน build ครั้งแรก
+
+### Android (native app)
+
+```bash
+cd telemedicine_app
+flutter run                      # debug บน device/emulator — ไม่ต้องใส่ dart-define
+                                 # (Firebase auto-init จาก android/app/google-services.json)
+flutter run --dart-define-from-file=.env   # ถ้าต้องการ TURN relay (คนละเน็ต)
+```
+
+- ต้องมี `android/app/google-services.json` (gitignored — ขอจากทีม)
+- Android เป็นได้ทั้งคนไข้/หมอ: video call + voice ใช้ได้เต็ม, heart sound ยัง web-only
+- ทดสอบ android↔web: เปิด web ฝั่งหนึ่ง + app อีกฝั่งหนึ่ง ใช้รหัสห้อง 6 หลักเหมือนกัน
 
 ### Test heart sound
 
@@ -218,7 +234,8 @@ m=video ... b=AS:800   ; cap video at 800 kbps (headroom for Android tablet hw e
 
 ## Known Limitations
 
-- **Native iOS/Android**: heart sound feature (SimAudio + Live mic + PCM playback) ไม่รองรับ — ใช้ได้แค่ video call + voice (ดู Roadmap)
+- **Native Android**: video call + voice ทำงานแล้ว (android↔web ok) แต่ heart sound feature (SimAudio + Live mic + PCM playback) ยังไม่รองรับ — web-only (ดู Roadmap). iOS ยังไม่ได้ทดสอบ
+- **Cross-network (คนละเน็ต)**: ต้องมี TURN relay ถ้า NAT เป็น symmetric (มือถือ/carrier) — เติม `TURN_USERNAME`/`TURN_CREDENTIAL` (metered.ca ฟรี 50GB/เดือน) ใน `.env` แล้ว rebuild
 - **Same-machine testing**: ต้องใช้หูฟัง หรือ mute ปุ่ม 🎤 ตัด acoustic loop
 - **PCM bandwidth**: ~256 kbps (Int16 × 16kHz mono) — เพียงพอ mobile 4G ทั่วไป
 - **Recording**: blob URL ใน memory เท่านั้น — refresh page หาย (ดู Roadmap → Firebase Storage)

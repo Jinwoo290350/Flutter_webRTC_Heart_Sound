@@ -82,12 +82,29 @@ class WebRTCConfig {
   static String modifySdp(String sdp) {
     const opusParams = 'usedtx=0;maxplaybackrate=48000;sprop-maxcapturerate=48000;'
         'stereo=0;sprop-stereo=0';
-    String result = sdp.replaceAllMapped(
-      RegExp(r'(a=fmtp:\d+ .*)'),
-      (m) => '${m[1]};$opusParams',
-    );
-    // จำกัด video bitrate 800 kbps — Android tablet hardware encoder อาจ burst เกิน 500
-    // ที่ 640x480@24 → frame drop. 800 ให้ headroom + ยัง audio priority บนเน็ตช้า
+    String result = sdp;
+
+    // หา payload type ของ Opus จาก a=rtpmap:<pt> opus/48000/2 แล้วเติม param เฉพาะ
+    // Opus เท่านั้น — ห้ามเติมทับ fmtp ของ video codec (H264/VP8/RTX) เพราะ Android
+    // native SDP มีหลาย codec → เดิม regex เติมทุก fmtp ทำ SDP วิดีโอพัง → android↔web ต่อไม่ติด
+    final opusPts = RegExp(r'a=rtpmap:(\d+)\s+opus/48000', caseSensitive: false)
+        .allMatches(sdp)
+        .map((m) => m.group(1)!)
+        .toSet();
+    for (final pt in opusPts) {
+      final fmtp = RegExp('a=fmtp:$pt ([^\\r\\n]*)');
+      if (fmtp.hasMatch(result)) {
+        result = result.replaceAllMapped(fmtp, (m) => 'a=fmtp:$pt ${m[1]};$opusParams');
+      } else {
+        // ไม่มี fmtp line ของ Opus → เพิ่มต่อจาก rtpmap
+        result = result.replaceAllMapped(
+          RegExp('(a=rtpmap:$pt opus/48000[^\\r\\n]*)', caseSensitive: false),
+          (m) => '${m[1]}\r\na=fmtp:$pt $opusParams',
+        );
+      }
+    }
+
+    // จำกัด video bitrate 800 kbps — audio priority บนเน็ตช้า
     result = result.replaceAllMapped(
       RegExp(r'(m=video [^\r\n]*)'),
       (m) => '${m[1]}\r\nb=AS:800',
